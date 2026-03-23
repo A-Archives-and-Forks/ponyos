@@ -15,6 +15,7 @@
 #include <sys/time.h>
 #include <sys/times.h>
 #include <sys/ptrace.h>
+#include <sys/signal.h>
 #include <syscall_nums.h>
 #include <kernel/printf.h>
 #include <kernel/process.h>
@@ -30,6 +31,7 @@
 #include <kernel/syscall.h>
 #include <kernel/misc.h>
 #include <kernel/ptrace.h>
+#include <kernel/net/netif.h>
 
 static char   hostname[256];
 static size_t hostname_len = 0;
@@ -53,6 +55,7 @@ long sys_sbrk(ssize_t size) {
 	if (proc->group != 0) {
 		proc = process_from_pid(proc->group);
 	}
+	if (!proc) return -EINVAL;
 	spin_lock(proc->image.lock);
 	uintptr_t out = proc->image.heap;
 	for (uintptr_t i = out; i < out + size; i += 0x1000) {
@@ -95,7 +98,7 @@ long sys_sysfunc(long fn, char ** args) {
 			printf("kdebug: not implemented\n");
 			return -EINVAL;
 
-		case 42:
+		case TOARU_SYS_FUNC_CLEARICACHE:
 			#ifdef __aarch64__
 			PTR_VALIDATE(&args[0]);
 			PTR_VALIDATE(&args[1]);
@@ -104,21 +107,22 @@ long sys_sysfunc(long fn, char ** args) {
 			#endif
 			return 0;
 
-		case 43: {
+		case TOARU_SYS_FUNC_MUNMAP: {
 			extern void mmu_unmap_user(uintptr_t addr, size_t size);
 			PTR_VALIDATE(&args[0]);
 			PTR_VALIDATE(&args[1]);
+			volatile process_t * volatile proc = this_core->current_process;
+			if (proc->group != 0) proc = process_from_pid(proc->group);
+			if (!proc) return -EFAULT;
+			spin_lock(proc->image.lock);
 			mmu_unmap_user((uintptr_t)args[0], (size_t)args[1]);
+			spin_unlock(proc->image.lock);
 			return 0;
 		}
 
 		case TOARU_SYS_FUNC_INSMOD:
 			/* Linux has init_module as a system call? */
 			if (this_core->current_process->user != 0) return -EACCES;
-			#if defined(__aarch64__)
-			/* TODO: Most modules are not right for this and we are missing relocations */
-			return -EINVAL;
-			#endif
 			PTR_VALIDATE(args);
 			if (!args) return -EFAULT;
 			PTR_VALIDATE(args[0]);
@@ -137,6 +141,7 @@ long sys_sysfunc(long fn, char ** args) {
 			if (!args[0]) return -EFAULT;
 			volatile process_t * volatile proc = this_core->current_process;
 			if (proc->group != 0) proc = process_from_pid(proc->group);
+			if (!proc) return -EFAULT;
 			spin_lock(proc->image.lock);
 			proc->image.heap = (uintptr_t)args[0];
 			spin_unlock(proc->image.lock);
@@ -151,6 +156,7 @@ long sys_sysfunc(long fn, char ** args) {
 			if (!args) return -EFAULT;
 			volatile process_t * volatile proc = this_core->current_process;
 			if (proc->group != 0) proc = process_from_pid(proc->group);
+			if (!proc) return -EFAULT;
 			spin_lock(proc->image.lock);
 			/* Align inputs */
 			uintptr_t start = ((uintptr_t)args[0]) & 0xFFFFffffFFFFf000UL;
@@ -234,6 +240,30 @@ long sys_write(int fd, char * ptr, unsigned long len) {
 	return -EBADF;
 }
 
+long sys_pwrite(int fd, void * ptr, size_t count, off_t offset) {
+	if (FD_CHECK(fd)) {
+		if ((FD_ENTRY(fd)->flags & FS_PIPE) || (FD_ENTRY(fd)->flags & FS_CHARDEVICE) || (FD_ENTRY(fd)->flags & FS_SOCKET)) return -ESPIPE;
+		PTRCHECK(ptr,count,MMU_PTR_NULL);
+		fs_node_t * node = FD_ENTRY(fd);
+		if (!(FD_MODE(fd) & 2)) return -EACCES;
+		if (count && !ptr) return -EFAULT;
+		return write_fs(node, offset, count, (uint8_t*)ptr);
+	}
+	return -EBADF;
+}
+
+long sys_pread(int fd, void * ptr, size_t count, off_t offset) {
+	if (FD_CHECK(fd)) {
+		if ((FD_ENTRY(fd)->flags & FS_PIPE) || (FD_ENTRY(fd)->flags & FS_CHARDEVICE) || (FD_ENTRY(fd)->flags & FS_SOCKET)) return -ESPIPE;
+		PTRCHECK(ptr,count,MMU_PTR_NULL|MMU_PTR_WRITE);
+		fs_node_t * node = FD_ENTRY(fd);
+		if (!(FD_MODE(fd) & 01)) return -EACCES;
+		if (count && !ptr) return -EFAULT;
+		return read_fs(node, offset, count, (uint8_t *)ptr);
+	}
+	return -EBADF;
+}
+
 static long stat_node(fs_node_t * fn, uintptr_t st) {
 	struct stat * f = (struct stat *)st;
 
@@ -253,6 +283,7 @@ static long stat_node(fs_node_t * fn, uintptr_t st) {
 	if (fn->flags & FS_BLOCKDEVICE) { flags |= _IFBLK; }
 	if (fn->flags & FS_PIPE)        { flags |= _IFIFO; }
 	if (fn->flags & FS_SYMLINK)     { flags |= _IFLNK; }
+	if (fn->flags & FS_SOCKET)      { flags |= _IFSOCK; }
 
 	f->st_mode  = fn->mask | flags;
 	f->st_nlink = fn->nlink;
@@ -261,9 +292,12 @@ static long stat_node(fs_node_t * fn, uintptr_t st) {
 	f->st_rdev  = 0;
 	f->st_size  = fn->length;
 
-	f->st_atime = fn->atime;
-	f->st_mtime = fn->mtime;
-	f->st_ctime = fn->ctime;
+	f->st_atim.tv_sec = fn->atime;
+	f->st_atim.tv_nsec = 0;
+	f->st_mtim.tv_sec = fn->mtime;
+	f->st_mtim.tv_nsec = 0;
+	f->st_ctim.tv_sec = fn->ctime;
+	f->st_ctim.tv_nsec = 0;
 	f->st_blksize = 512; /* whatever */
 
 	if (fn->get_size) {
@@ -306,6 +340,7 @@ long sys_symlink(char * target, char * name) {
 
 long sys_readlink(const char * file, char * ptr, long len) {
 	PTR_VALIDATE(file);
+	PTRCHECK(ptr,len,0);
 	if (!file) return -EFAULT;
 	fs_node_t * node = kopen((char *) file, O_PATH | O_NOFOLLOW);
 	if (!node) {
@@ -340,6 +375,25 @@ long sys_open(const char * file, long flags, long mode) {
 		return -EEXIST;
 	}
 
+	if (!node && (flags & O_CREAT)) {
+		int result = create_file_fs((char *)file, mode);
+		/*
+		 * This still potentially has an issue, particularly with
+		 * O_EXCL, where another process can replace this file,
+		 * or otherwise create a different file, and then the
+		 * file we created above is not the one we are opening.
+		 *
+		 * In the new VFS, creating a file should return an
+		 * inode/dirent representing the new file, so we don't
+		 * have to go and immediately try to open it.
+		 */
+		if (!result) {
+			node = kopen((char *)file, flags);
+		} else {
+			return result;
+		}
+	}
+
 	if (!(flags & O_WRONLY) || (flags & O_RDWR)) {
 		if (node && !has_permission(node, 04)) {
 			close_fs(node);
@@ -363,16 +417,6 @@ long sys_open(const char * file, long flags, long mode) {
 		}
 	}
 
-	if (!node && (flags & O_CREAT)) {
-		/* TODO check directory permissions */
-		int result = create_file_fs((char *)file, mode);
-		if (!result) {
-			node = kopen((char *)file, flags);
-		} else {
-			return result;
-		}
-	}
-
 	if (node && (flags & O_DIRECTORY)) {
 		if (!(node->flags & FS_DIRECTORY)) {
 			return -ENOTDIR;
@@ -384,7 +428,7 @@ long sys_open(const char * file, long flags, long mode) {
 			close_fs(node);
 			return -EINVAL;
 		}
-		truncate_fs(node);
+		truncate_fs(node, 0);
 	}
 
 	if (!node) {
@@ -415,7 +459,7 @@ long sys_close(int fd) {
 
 long sys_seek(int fd, long offset, long whence) {
 	if (FD_CHECK(fd)) {
-		if ((FD_ENTRY(fd)->flags & FS_PIPE) || (FD_ENTRY(fd)->flags & FS_CHARDEVICE)) return -ESPIPE;
+		if ((FD_ENTRY(fd)->flags & FS_PIPE) || (FD_ENTRY(fd)->flags & FS_CHARDEVICE) || (FD_ENTRY(fd)->flags & FS_SOCKET)) return -ESPIPE;
 		switch (whence) {
 			case 0:
 				FD_OFFSET(fd) = offset;
@@ -509,6 +553,22 @@ long sys_chmod(char * file, long mode) {
 	}
 }
 
+long sys_fchmod(int fd, long mode) {
+	if (!FD_CHECK(fd)) return -EBADF;
+	if (this_core->current_process->user != 0 && this_core->current_process->user != FD_ENTRY(fd)->uid) return -EACCES;
+	return chmod_fs(FD_ENTRY(fd), mode);
+}
+
+long sys_rename(const char * src, const char * dest) {
+	PTR_VALIDATE(src);
+	if (!src) return -EFAULT;
+	PTR_VALIDATE(dest);
+	if (!dest) return -EFAULT;
+
+	extern int rename_file_fs(const char * src, const char * dest);
+	return rename_file_fs(src, dest);
+}
+
 static int current_group_matches(gid_t gid) {
 	if (gid == this_core->current_process->user_group) return 1;
 	for (int i = 0; i < this_core->current_process->supplementary_group_count; ++i) {
@@ -556,6 +616,56 @@ long sys_chown(char * file, uid_t uid, uid_t gid) {
 _access:
 	close_fs(fn);
 	return -EACCES;
+}
+
+long sys_fchown(int fd, uid_t uid, uid_t gid) {
+	if (!FD_CHECK(fd)) return -EBADF;
+	if (this_core->current_process->user != USER_ROOT_UID && uid != -1) return -EACCES;
+	if (this_core->current_process->user != USER_ROOT_UID && gid != -1) {
+		if (this_core->current_process->user != FD_ENTRY(fd)->uid) return -EACCES;
+		if (!current_group_matches(gid)) return -EACCES;
+	}
+
+	if ((uid != -1 || gid != -1) && (FD_ENTRY(fd)->mask & 0x800)) {
+		/* Whenever the owner or group of a setuid executable is changed, it
+		 * loses the setuid bit. */
+		 chmod_fs(FD_ENTRY(fd), FD_ENTRY(fd)->mask & (~0x800));
+	}
+
+	return chown_fs(FD_ENTRY(fd), uid, gid);
+}
+
+long sys_truncate(char * file, off_t size) {
+	PTR_VALIDATE(file);
+	if (!file) return -EFAULT;
+	if (size < 0) return -EINVAL;
+
+	fs_node_t * fn = kopen(file, 0);
+
+	if (!fn) return -ENOENT;
+
+	/* Need write permission */
+	if (!has_permission(fn, 04)) {
+		close_fs(fn);
+		return -EACCES;
+	}
+
+	if (!fn->truncate) {
+		close_fs(fn);
+		return -ENOTSUP;
+	}
+
+	long out = fn->truncate(fn, size);
+	close_fs(fn);
+	return out;
+}
+
+long sys_ftruncate(int fd, off_t size) {
+	if (!FD_CHECK(fd)) return -EBADF;
+	if (!(FD_MODE(fd) & 2)) return -EACCES;
+	if (size < 0) return -EINVAL;
+	if (!FD_ENTRY(fd)->truncate) return -ENOTSUP;
+	return FD_ENTRY(fd)->truncate(FD_ENTRY(fd), size);
 }
 
 long sys_gettimeofday(struct timeval * tv, void * tz) {
@@ -776,6 +886,40 @@ long sys_dup2(int old, int new) {
 	return process_move_fd((process_t *)this_core->current_process, old, new);
 }
 
+long sys_fcntl(int fd, int cmd, long arg) {
+	if (!FD_CHECK(fd)) return -EBADF;
+
+	switch (cmd) {
+		case F_GETFD:
+			return 0; /* We don't support any flags. CLOEXEC is the only thing in here. */
+		case F_SETFD:
+			return 0; /* We don't support any flags, so can't set any flags. */
+		case F_GETFL: {
+			int mode = 0;
+			if (FD_MODE(fd) & 03) mode = O_RDWR;
+			else if (FD_MODE(fd) & 01) mode = O_RDONLY;
+			else if (FD_MODE(fd) & 02) mode = O_WRONLY;
+			/* TODO we don't persist O_APPEND and there are other flags we don't support */
+			return mode;
+		}
+		case F_SETFL: {
+			return 0; /* TODO NONBLOCK, APPEND, SYNC... */
+		}
+		case F_DUPFD: {
+			if (arg < 0 || arg > 256) return -EINVAL; /* We expect a value of, like, 10 from dash. */
+			extern long process_fd_dup_least(process_t *, long, long);
+			return process_fd_dup_least((process_t*)this_core->current_process, fd, arg);
+		}
+		case F_GETLK:
+		case F_SETLK:
+		case F_SETLKW:
+			/* No lock support */
+			return -EINVAL;
+	}
+
+	return -EINVAL;
+}
+
 long sys_sethostname(char * new_hostname) {
 	if (this_core->current_process->user == USER_ROOT_UID) {
 		PTR_VALIDATE(new_hostname);
@@ -948,17 +1092,97 @@ long sys_pipe(int pipes[2]) {
 }
 
 long sys_signal(long signum, uintptr_t handler) {
-	if (signum > NUMSIGNALS) {
-		return -EINVAL;
-	}
-	uintptr_t old = this_core->current_process->signals[signum];
-	this_core->current_process->signals[signum] = handler;
+	if (signum >= NUMSIGNALS || signum < 0) return -EINVAL;
+	if (signum == SIGKILL || signum == SIGSTOP) return -EINVAL;
+	uintptr_t old = this_core->current_process->signals[signum].handler;
+	this_core->current_process->signals[signum].handler = handler;
+	this_core->current_process->signals[signum].flags = SA_RESTART;
 	return old;
+}
+
+long sys_sigaction(int signum, struct sigaction *act, struct sigaction *oldact) {
+	if (act) PTRCHECK(act,sizeof(struct sigaction),0);
+	if (oldact) PTRCHECK(oldact,sizeof(struct sigaction),MMU_PTR_WRITE);
+
+	if (signum >= NUMSIGNALS || signum < 0) return -EINVAL;
+	if (signum == SIGKILL || signum == SIGSTOP) return -EINVAL;
+
+	if (oldact) {
+		oldact->sa_handler = (_sig_func_ptr)this_core->current_process->signals[signum].handler;
+		oldact->sa_mask    = this_core->current_process->signals[signum].mask;
+		oldact->sa_flags   = this_core->current_process->signals[signum].flags;
+	}
+
+	if (act) {
+		this_core->current_process->signals[signum].handler = (uintptr_t)act->sa_handler;
+		this_core->current_process->signals[signum].mask    = act->sa_mask;
+		this_core->current_process->signals[signum].flags   = act->sa_flags;
+	}
+
+	return 0;
+}
+
+long sys_sigpending(sigset_t * set) {
+	PTRCHECK(set,sizeof(sigset_t),MMU_PTR_WRITE);
+	*set = this_core->current_process->pending_signals;
+	return 0;
+}
+
+long sys_sigprocmask(int how, sigset_t *restrict set, sigset_t * restrict oset) {
+	if (oset) {
+		PTRCHECK(oset,sizeof(sigset_t),MMU_PTR_WRITE);
+		*oset = this_core->current_process->blocked_signals;
+	}
+
+	if (set) {
+		PTRCHECK(set,sizeof(sigset_t),0);
+		switch (how) {
+			case SIG_SETMASK:
+				this_core->current_process->blocked_signals = *set;
+				break;
+			case SIG_BLOCK:
+				this_core->current_process->blocked_signals |= *set;
+				break;
+			case SIG_UNBLOCK:
+				this_core->current_process->blocked_signals &= ~*set;
+				break;
+			default:
+				return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+extern void signal_wait(void);
+long sys_sigsuspend(const sigset_t *set) {
+	PTRCHECK(set,sizeof(sigset_t),0);
+
+	this_core->current_process->restored_signals = this_core->current_process->blocked_signals;
+	this_core->current_process->blocked_signals = *set;
+
+	signal_wait();
+
+	__sync_or_and_fetch(&this_core->current_process->flags, PROC_FLAG_RESTORE_SIGMASK);
+	return -ERESTARTSIGSUSPEND;
+}
+
+long sys_sigwait(sigset_t * set, int * sig) {
+	PTRCHECK(set,sizeof(sigset_t),0);
+	PTRCHECK(sig,sizeof(int),MMU_PTR_WRITE);
+
+	/* Silently ignore attempts to wait on KILL or STOP */
+	sigset_t awaited = *set & ~((1 << SIGKILL) | (1 << SIGSTOP));
+
+	/* Don't let processes wait on unblocked signals */
+	if (awaited & ~this_core->current_process->blocked_signals) return -EINVAL;
+
+	return signal_await(awaited, sig);
 }
 
 long sys_fswait(int c, int fds[]) {
 	PTR_VALIDATE(fds);
-	if (!fds) return -EFAULT;
+	if (!fds || c < 0) return -EFAULT;
 	for (int i = 0; i < c; ++i) {
 		if (!FD_CHECK(fds[i])) return -EBADF;
 	}
@@ -975,7 +1199,7 @@ long sys_fswait(int c, int fds[]) {
 
 long sys_fswait_timeout(int c, int fds[], int timeout) {
 	PTR_VALIDATE(fds);
-	if (!fds) return -EFAULT;
+	if (!fds || c < 0) return -EFAULT;
 	for (int i = 0; i < c; ++i) {
 		if (!FD_CHECK(fds[i])) return -EBADF;
 	}
@@ -993,7 +1217,7 @@ long sys_fswait_timeout(int c, int fds[], int timeout) {
 long sys_fswait_multi(int c, int fds[], int timeout, int out[]) {
 	PTR_VALIDATE(fds);
 	PTR_VALIDATE(out);
-	if (!fds || !out) return -EFAULT;
+	if (!fds || !out || c < 0) return -EFAULT;
 	int has_match = -1;
 	for (int i = 0; i < c; ++i) {
 		if (!FD_CHECK(fds[i])) {
@@ -1011,7 +1235,7 @@ long sys_fswait_multi(int c, int fds[], int timeout, int out[]) {
 	if (has_match != -1) return has_match;
 
 	int result = sys_fswait_timeout(c, fds, timeout);
-	if (result >= 0) out[result] = 1;
+	if (result >= 0 && result < c) out[result] = 1;
 	return result;
 }
 
@@ -1077,130 +1301,138 @@ long sys_times(struct tms *buf) {
 	if (buf) {
 		PTR_VALIDATE(buf);
 
-		buf->tms_utime  = this_core->current_process->time_total        / arch_cpu_mhz();
+		buf->tms_utime  = (this_core->current_process->time_total - this_core->current_process->time_sys) / arch_cpu_mhz();
 		buf->tms_stime  = this_core->current_process->time_sys          / arch_cpu_mhz();
-		buf->tms_cutime = this_core->current_process->time_children     / arch_cpu_mhz();
+		buf->tms_cutime = (this_core->current_process->time_children - this_core->current_process->time_sys_children) / arch_cpu_mhz();
 		buf->tms_cstime = this_core->current_process->time_sys_children / arch_cpu_mhz();
 	}
 
 	return arch_perf_timer() / arch_cpu_mhz();
 }
 
-extern long net_socket();
-extern long net_setsockopt();
-extern long net_bind();
-extern long net_accept();
-extern long net_listen();
-extern long net_connect();
-extern long net_getsockopt();
-extern long net_recv();
-extern long net_send();
-extern long net_shutdown();
-
 extern long ptrace_handle(long,pid_t,void*,void*);
 
-static long (*syscalls[])() = {
-	/* System Call Table */
-	[SYS_EXT]          = sys_exit,
-	[SYS_GETEUID]      = sys_geteuid,
-	[SYS_OPEN]         = sys_open,
-	[SYS_READ]         = sys_read,
-	[SYS_WRITE]        = sys_write,
-	[SYS_CLOSE]        = sys_close,
-	[SYS_GETTIMEOFDAY] = sys_gettimeofday,
-	[SYS_GETPID]       = sys_getpid,
-	[SYS_SBRK]         = sys_sbrk,
-	[SYS_UNAME]        = sys_uname,
-	[SYS_SEEK]         = sys_seek,
-	[SYS_STAT]         = sys_stat,
-	[SYS_GETUID]       = sys_getuid,
-	[SYS_SETUID]       = sys_setuid,
-	[SYS_READDIR]      = sys_readdir,
-	[SYS_CHDIR]        = sys_chdir,
-	[SYS_GETCWD]       = sys_getcwd,
-	[SYS_SETHOSTNAME]  = sys_sethostname,
-	[SYS_GETHOSTNAME]  = sys_gethostname,
-	[SYS_MKDIR]        = sys_mkdir,
-	[SYS_GETTID]       = sys_gettid,
-	[SYS_SYSFUNC]      = sys_sysfunc,
-	[SYS_IOCTL]        = sys_ioctl,
-	[SYS_ACCESS]       = sys_access,
-	[SYS_STATF]        = sys_statf,
-	[SYS_CHMOD]        = sys_chmod,
-	[SYS_UMASK]        = sys_umask,
-	[SYS_UNLINK]       = sys_unlink,
-	[SYS_MOUNT]        = sys_mount,
-	[SYS_SYMLINK]      = sys_symlink,
-	[SYS_READLINK]     = sys_readlink,
-	[SYS_LSTAT]        = sys_lstat,
-	[SYS_CHOWN]        = sys_chown,
-	[SYS_SETSID]       = sys_setsid,
-	[SYS_SETPGID]      = sys_setpgid,
-	[SYS_GETPGID]      = sys_getpgid,
-	[SYS_DUP2]         = sys_dup2,
-	[SYS_EXECVE]       = sys_execve,
-	[SYS_FORK]         = sys_fork,
-	[SYS_WAITPID]      = sys_waitpid,
-	[SYS_YIELD]        = sys_yield,
-	[SYS_SLEEPABS]     = sys_sleepabs,
-	[SYS_SLEEP]        = sys_sleep,
-	[SYS_PIPE]         = sys_pipe,
-	[SYS_FSWAIT]       = sys_fswait,
-	[SYS_FSWAIT2]      = sys_fswait_timeout,
-	[SYS_FSWAIT3]      = sys_fswait_multi,
-	[SYS_CLONE]        = sys_clone,
-	[SYS_OPENPTY]      = sys_openpty,
-	[SYS_SHM_OBTAIN]   = sys_shm_obtain,
-	[SYS_SHM_RELEASE]  = sys_shm_release,
-	[SYS_SIGNAL]       = sys_signal,
-	[SYS_KILL]         = sys_kill,
-	[SYS_REBOOT]       = sys_reboot,
-	[SYS_GETGID]       = sys_getgid,
-	[SYS_GETEGID]      = sys_getegid,
-	[SYS_SETGID]       = sys_setgid,
-	[SYS_GETGROUPS]    = sys_getgroups,
-	[SYS_SETGROUPS]    = sys_setgroups,
-	[SYS_TIMES]        = sys_times,
-	[SYS_PTRACE]       = ptrace_handle,
-	[SYS_SETTIMEOFDAY] = sys_settimeofday,
+typedef long (*scall_func)(long,long,long,long,long);
 
-	[SYS_SOCKET]       = net_socket,
-	[SYS_SETSOCKOPT]   = net_setsockopt,
-	[SYS_BIND]         = net_bind,
-	[SYS_ACCEPT]       = net_accept,
-	[SYS_LISTEN]       = net_listen,
-	[SYS_CONNECT]      = net_connect,
-	[SYS_GETSOCKOPT]   = net_getsockopt,
-	[SYS_RECV]         = net_recv,
-	[SYS_SEND]         = net_send,
-	[SYS_SHUTDOWN]     = net_shutdown,
+static scall_func syscalls[] = {
+	/* System Call Table */
+	[SYS_EXT]          = (scall_func)(uintptr_t)sys_exit,
+	[SYS_GETEUID]      = (scall_func)(uintptr_t)sys_geteuid,
+	[SYS_OPEN]         = (scall_func)(uintptr_t)sys_open,
+	[SYS_READ]         = (scall_func)(uintptr_t)sys_read,
+	[SYS_WRITE]        = (scall_func)(uintptr_t)sys_write,
+	[SYS_CLOSE]        = (scall_func)(uintptr_t)sys_close,
+	[SYS_GETTIMEOFDAY] = (scall_func)(uintptr_t)sys_gettimeofday,
+	[SYS_GETPID]       = (scall_func)(uintptr_t)sys_getpid,
+	[SYS_SBRK]         = (scall_func)(uintptr_t)sys_sbrk,
+	[SYS_UNAME]        = (scall_func)(uintptr_t)sys_uname,
+	[SYS_SEEK]         = (scall_func)(uintptr_t)sys_seek,
+	[SYS_STAT]         = (scall_func)(uintptr_t)sys_stat,
+	[SYS_GETUID]       = (scall_func)(uintptr_t)sys_getuid,
+	[SYS_SETUID]       = (scall_func)(uintptr_t)sys_setuid,
+	[SYS_READDIR]      = (scall_func)(uintptr_t)sys_readdir,
+	[SYS_CHDIR]        = (scall_func)(uintptr_t)sys_chdir,
+	[SYS_GETCWD]       = (scall_func)(uintptr_t)sys_getcwd,
+	[SYS_SETHOSTNAME]  = (scall_func)(uintptr_t)sys_sethostname,
+	[SYS_GETHOSTNAME]  = (scall_func)(uintptr_t)sys_gethostname,
+	[SYS_MKDIR]        = (scall_func)(uintptr_t)sys_mkdir,
+	[SYS_GETTID]       = (scall_func)(uintptr_t)sys_gettid,
+	[SYS_SYSFUNC]      = (scall_func)(uintptr_t)sys_sysfunc,
+	[SYS_IOCTL]        = (scall_func)(uintptr_t)sys_ioctl,
+	[SYS_ACCESS]       = (scall_func)(uintptr_t)sys_access,
+	[SYS_STATF]        = (scall_func)(uintptr_t)sys_statf,
+	[SYS_CHMOD]        = (scall_func)(uintptr_t)sys_chmod,
+	[SYS_UMASK]        = (scall_func)(uintptr_t)sys_umask,
+	[SYS_UNLINK]       = (scall_func)(uintptr_t)sys_unlink,
+	[SYS_MOUNT]        = (scall_func)(uintptr_t)sys_mount,
+	[SYS_SYMLINK]      = (scall_func)(uintptr_t)sys_symlink,
+	[SYS_READLINK]     = (scall_func)(uintptr_t)sys_readlink,
+	[SYS_LSTAT]        = (scall_func)(uintptr_t)sys_lstat,
+	[SYS_CHOWN]        = (scall_func)(uintptr_t)sys_chown,
+	[SYS_SETSID]       = (scall_func)(uintptr_t)sys_setsid,
+	[SYS_SETPGID]      = (scall_func)(uintptr_t)sys_setpgid,
+	[SYS_GETPGID]      = (scall_func)(uintptr_t)sys_getpgid,
+	[SYS_DUP2]         = (scall_func)(uintptr_t)sys_dup2,
+	[SYS_EXECVE]       = (scall_func)(uintptr_t)sys_execve,
+	[SYS_FORK]         = (scall_func)(uintptr_t)sys_fork,
+	[SYS_WAITPID]      = (scall_func)(uintptr_t)sys_waitpid,
+	[SYS_YIELD]        = (scall_func)(uintptr_t)sys_yield,
+	[SYS_SLEEPABS]     = (scall_func)(uintptr_t)sys_sleepabs,
+	[SYS_SLEEP]        = (scall_func)(uintptr_t)sys_sleep,
+	[SYS_PIPE]         = (scall_func)(uintptr_t)sys_pipe,
+	[SYS_FSWAIT]       = (scall_func)(uintptr_t)sys_fswait,
+	[SYS_FSWAIT2]      = (scall_func)(uintptr_t)sys_fswait_timeout,
+	[SYS_FSWAIT3]      = (scall_func)(uintptr_t)sys_fswait_multi,
+	[SYS_CLONE]        = (scall_func)(uintptr_t)sys_clone,
+	[SYS_OPENPTY]      = (scall_func)(uintptr_t)sys_openpty,
+	[SYS_SHM_OBTAIN]   = (scall_func)(uintptr_t)sys_shm_obtain,
+	[SYS_SHM_RELEASE]  = (scall_func)(uintptr_t)sys_shm_release,
+	[SYS_SIGNAL]       = (scall_func)(uintptr_t)sys_signal,
+	[SYS_KILL]         = (scall_func)(uintptr_t)sys_kill,
+	[SYS_REBOOT]       = (scall_func)(uintptr_t)sys_reboot,
+	[SYS_GETGID]       = (scall_func)(uintptr_t)sys_getgid,
+	[SYS_GETEGID]      = (scall_func)(uintptr_t)sys_getegid,
+	[SYS_SETGID]       = (scall_func)(uintptr_t)sys_setgid,
+	[SYS_GETGROUPS]    = (scall_func)(uintptr_t)sys_getgroups,
+	[SYS_SETGROUPS]    = (scall_func)(uintptr_t)sys_setgroups,
+	[SYS_TIMES]        = (scall_func)(uintptr_t)sys_times,
+	[SYS_PTRACE]       = (scall_func)(uintptr_t)ptrace_handle,
+	[SYS_SETTIMEOFDAY] = (scall_func)(uintptr_t)sys_settimeofday,
+	[SYS_SIGACTION]    = (scall_func)(uintptr_t)sys_sigaction,
+	[SYS_SIGPENDING]   = (scall_func)(uintptr_t)sys_sigpending,
+	[SYS_SIGPROCMASK]  = (scall_func)(uintptr_t)sys_sigprocmask,
+	[SYS_SIGSUSPEND]   = (scall_func)(uintptr_t)sys_sigsuspend,
+	[SYS_SIGWAIT]      = (scall_func)(uintptr_t)sys_sigwait,
+	[SYS_PREAD]        = (scall_func)(uintptr_t)sys_pread,
+	[SYS_PWRITE]       = (scall_func)(uintptr_t)sys_pwrite,
+	[SYS_RENAME]       = (scall_func)(uintptr_t)sys_rename,
+	[SYS_FCNTL]        = (scall_func)(uintptr_t)sys_fcntl,
+	[SYS_FCHMOD]       = (scall_func)(uintptr_t)sys_fchmod,
+	[SYS_FCHOWN]       = (scall_func)(uintptr_t)sys_fchown,
+	[SYS_TRUNCATE]     = (scall_func)(uintptr_t)sys_truncate,
+	[SYS_FTRUNCATE]    = (scall_func)(uintptr_t)sys_ftruncate,
+
+	[SYS_SOCKET]       = (scall_func)(uintptr_t)net_socket,
+	[SYS_SETSOCKOPT]   = (scall_func)(uintptr_t)net_setsockopt,
+	[SYS_BIND]         = (scall_func)(uintptr_t)net_bind,
+	[SYS_ACCEPT]       = (scall_func)(uintptr_t)net_accept,
+	[SYS_LISTEN]       = (scall_func)(uintptr_t)net_listen,
+	[SYS_CONNECT]      = (scall_func)(uintptr_t)net_connect,
+	[SYS_GETSOCKOPT]   = (scall_func)(uintptr_t)net_getsockopt,
+	[SYS_RECV]         = (scall_func)(uintptr_t)net_recv,
+	[SYS_SEND]         = (scall_func)(uintptr_t)net_send,
+	[SYS_SHUTDOWN]     = (scall_func)(uintptr_t)net_shutdown,
+	[SYS_GETSOCKNAME]  = (scall_func)(uintptr_t)net_getsockname,
+	[SYS_GETPEERNAME]  = (scall_func)(uintptr_t)net_getpeername,
 };
 
 static long num_syscalls = sizeof(syscalls) / sizeof(*syscalls);
-typedef long (*scall_func)();
 
 void syscall_handler(struct regs * r) {
 
-	if (arch_syscall_number(r) >= num_syscalls) {
-		arch_syscall_return(r, -EINVAL);
-		return;
-	}
-
-	scall_func func = syscalls[arch_syscall_number(r)];
 	this_core->current_process->syscall_registers = r;
 
 	if (this_core->current_process->flags & PROC_FLAG_TRACE_SYSCALLS) {
 		ptrace_signal(SIGTRAP, PTRACE_EVENT_SYSCALL_ENTER);
 	}
 
-	long result = func(
+	long result;
+
+	if (arch_syscall_number(r) < 0 || arch_syscall_number(r) >= num_syscalls) {
+		result = -EINVAL;
+		goto _finish_syscall;
+	}
+
+	scall_func func = syscalls[arch_syscall_number(r)];
+	result = func(
 		arch_syscall_arg0(r), arch_syscall_arg1(r), arch_syscall_arg2(r),
 		arch_syscall_arg3(r), arch_syscall_arg4(r));
 
-	if (result == -ERESTARTSYS) {
+	if (result == -ERESTARTSYS || result == -ERESTARTSIGSUSPEND) {
 		this_core->current_process->interrupted_system_call = arch_syscall_number(r);
 	}
 
+_finish_syscall:
 	arch_syscall_return(r, result);
 
 	if (this_core->current_process->flags & PROC_FLAG_TRACE_SYSCALLS) {

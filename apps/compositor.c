@@ -44,6 +44,7 @@
 #include <toaru/yutani-server.h>
 #include <toaru/hashmap.h>
 #include <toaru/list.h>
+#include <toaru/text.h>
 
 #define _DEBUG_YUTANI
 #ifdef _DEBUG_YUTANI
@@ -60,6 +61,17 @@ static void notify_subscribers(yutani_globals_t * yg);
 static void mouse_stop_drag(yutani_globals_t * yg);
 static void window_move(yutani_globals_t * yg, yutani_server_window_t * window, int x, int y);
 static yutani_server_window_t * top_at(yutani_globals_t * yg, uint16_t x, uint16_t y);
+static void window_unminimize(yutani_globals_t * yg, yutani_server_window_t * window);
+static void window_finish_minimize(yutani_globals_t * yg, yutani_server_window_t * w);
+
+#define ENABLE_BLUR_BEHIND
+#ifdef ENABLE_BLUR_BEHIND
+#define BLUR_CLIP_MAX 20
+#define BLUR_KERNEL   10
+static char * blur_texture = NULL;
+static gfx_context_t * blur_ctx = NULL;
+static gfx_context_t * clip_ctx = NULL;
+#endif
 
 /**
  * Print usage information.
@@ -246,6 +258,7 @@ static void unorder_window(yutani_globals_t * yg, yutani_server_window_t * w) {
 	}
 
 	list_t * zorder_owner = window_zorder_owner(yg, index);
+	if (!zorder_owner) return;
 	node_t * n = list_find(zorder_owner, w);
 	if (!n) return;
 	list_delete(zorder_owner, n);
@@ -314,13 +327,20 @@ static void set_focused_window(yutani_globals_t * yg, yutani_server_window_t * w
 		return; /* Already focused */
 	}
 
+	if (w && w->minimized) {
+		window_unminimize(yg,w);
+	}
+
 	if (yg->focused_window) {
 		/* Send focus change to old focused window */
 		yutani_msg_buildx_window_focus_change_alloc(response);
 		yutani_msg_buildx_window_focus_change(response, yg->focused_window->wid, 0);
 		pex_send(yg->server, yg->focused_window->owner, response->size, (char *)response);
 	}
+
+	if (!w) w = yg->bottom_z;
 	yg->focused_window = w;
+
 	if (w) {
 		/* Send focus change to new focused window */
 		yutani_msg_buildx_window_focus_change_alloc(response);
@@ -328,12 +348,6 @@ static void set_focused_window(yutani_globals_t * yg, yutani_server_window_t * w
 		pex_send(yg->server, w->owner, response->size, (char *)response);
 		make_top(yg, w);
 		mark_window(yg, w);
-	} else {
-		/*
-		 * There is no window to focus (we're unsetting focus);
-		 * default to the bottom window (background)
-		 */
-		yg->focused_window = yg->bottom_z;
 	}
 
 	/* Notify all subscribers of window changes */
@@ -347,6 +361,7 @@ static void set_focused_window(yutani_globals_t * yg, yutani_server_window_t * w
  */
 static yutani_server_window_t * get_focused(yutani_globals_t * yg) {
 	if (yg->focused_window) return yg->focused_window;
+	if (yg->bottom_z) set_focused_window(yg, yg->bottom_z);
 	return yg->bottom_z;
 }
 
@@ -369,7 +384,7 @@ static int yutani_pick_animation(uint32_t flags, int direction) {
  * Initializes a window of the particular size for a given client.
  */
 static yutani_server_window_t * server_window_create(yutani_globals_t * yg, int width, int height, uintptr_t owner, uint32_t flags) {
-	yutani_server_window_t * win = malloc(sizeof(yutani_server_window_t));
+	yutani_server_window_t * win = calloc(sizeof(yutani_server_window_t),1);
 
 	win->wid = next_wid();
 	win->owner = owner;
@@ -402,6 +417,7 @@ static yutani_server_window_t * server_window_create(yutani_globals_t * yg, int 
 	win->server_flags = flags;
 	win->opacity = 255;
 	win->hidden = 1;
+	win->minimized = 0;
 
 	char key[1024];
 	YUTANI_SHMKEY(yg->server_ident, key, 1024, win);
@@ -608,8 +624,7 @@ static void draw_cursor(yutani_globals_t * yg, int x, int y, int cursor) {
  * around the cursor, but it is relatively slow.
  */
 static yutani_server_window_t * check_top_at(yutani_globals_t * yg, yutani_server_window_t * w, uint16_t x, uint16_t y){
-	if (!w) return NULL;
-	if (w->hidden) return NULL;
+	if (!w || w->hidden || w->minimized) return NULL;
 	int32_t _x = -1, _y = -1;
 	yutani_device_to_window(w, x, y, &_x, &_y);
 	if (_x < 0 || _x >= w->width || _y < 0 || _y >= w->height) return NULL;
@@ -708,6 +723,30 @@ static inline int matrix_is_translation(gfx_matrix_t m) {
 	return (m[0][0] == 1.0 && m[0][1] == 0.0 && m[1][0] == 0.0 && m[1][1] == 1.0);
 }
 
+static void apply_rotation(yutani_globals_t * yg, yutani_server_window_t * window, gfx_matrix_t m, int16_t r) {
+	if (window == yg->resizing_window) {
+		if (r) {
+			gfx_matrix_translate(m, yg->resizing_init_w / 2, yg->resizing_init_h / 2);
+			gfx_matrix_rotate(m, (double)r * M_PI / 180.0);
+			gfx_matrix_translate(m, -yg->resizing_init_w / 2, -yg->resizing_init_h / 2);
+		}
+		double x_scale = (double)yg->resizing_w / (double)yg->resizing_window->width;
+		double y_scale = (double)yg->resizing_h / (double)yg->resizing_window->height;
+		if (x_scale < 0.00001) {
+			x_scale = 0.00001;
+		}
+		if (y_scale < 0.00001) {
+			y_scale = 0.00001;
+		}
+		gfx_matrix_translate(m, (int)yg->resizing_offset_x, (int)yg->resizing_offset_y);
+		gfx_matrix_scale(m, x_scale, y_scale);
+	} else if (r) {
+		gfx_matrix_translate(m, window->width / 2, window->height / 2);
+		gfx_matrix_rotate(m, (double)r * M_PI / 180.0);
+		gfx_matrix_translate(m, -window->width / 2, -window->height / 2);
+	}
+}
+
 /**
  * Blit a window to the framebuffer.
  *
@@ -716,7 +755,7 @@ static inline int matrix_is_translation(gfx_matrix_t m) {
  */
 static int yutani_blit_window(yutani_globals_t * yg, yutani_server_window_t * window, int x, int y) {
 
-	if (window->hidden) {
+	if (window->hidden || window->minimized) {
 		return 0;
 	}
 
@@ -730,34 +769,11 @@ static int yutani_blit_window(yutani_globals_t * yg, yutani_server_window_t * wi
 
 	double opacity = (double)(window->opacity) / 255.0;
 
-	if (window->rotation || window == yg->resizing_window || window->anim_mode) {
+	if (window->rotation || window == yg->resizing_window || window->anim_mode || (window->server_flags & YUTANI_WINDOW_FLAG_BLUR_BEHIND)) {
 		double m[2][3];
 
 		gfx_matrix_identity(m);
 		gfx_matrix_translate(m,x,y);
-
-		if (window == yg->resizing_window) {
-			if (window->rotation) {
-				gfx_matrix_translate(m, yg->resizing_init_w / 2, yg->resizing_init_h / 2);
-				gfx_matrix_rotate(m, (double)window->rotation * M_PI / 180.0);
-				gfx_matrix_translate(m, -yg->resizing_init_w / 2, -yg->resizing_init_h / 2);
-			}
-			double x_scale = (double)yg->resizing_w / (double)yg->resizing_window->width;
-			double y_scale = (double)yg->resizing_h / (double)yg->resizing_window->height;
-			if (x_scale < 0.00001) {
-				x_scale = 0.00001;
-			}
-			if (y_scale < 0.00001) {
-				y_scale = 0.00001;
-			}
-			gfx_matrix_translate(m, (int)yg->resizing_offset_x, (int)yg->resizing_offset_y);
-			gfx_matrix_scale(m, x_scale, y_scale);
-		} else if (window->rotation) {
-			gfx_matrix_translate(m, window->width / 2, window->height / 2);
-			gfx_matrix_rotate(m, (double)window->rotation * M_PI / 180.0);
-			gfx_matrix_translate(m, -window->width / 2, -window->height / 2);
-		}
-
 
 		if (window->anim_mode) {
 			int frame = yutani_time_since(yg, window->anim_start);
@@ -767,8 +783,13 @@ static int yutani_blit_window(yutani_globals_t * yg, yutani_server_window_t * wi
 					list_insert(yg->windows_to_remove, window);
 					return 0;
 				}
+				if (yutani_is_minimizing_animation[window->anim_mode]) {
+					list_insert(yg->windows_to_minimize, window);
+					return 0;
+				}
 				window->anim_mode = 0;
 				window->anim_start = 0;
+				apply_rotation(yg, window, m, window->rotation);
 			} else {
 				switch (window->anim_mode) {
 					case YUTANI_EFFECT_SQUEEZE_OUT:
@@ -780,6 +801,8 @@ static int yutani_blit_window(yutani_globals_t * yg, yutani_server_window_t * wi
 					case YUTANI_EFFECT_FADE_IN:
 						{
 							double time_diff = ((double)frame / (float)yutani_animation_lengths[window->anim_mode]);
+
+							apply_rotation(yg, window, m, window->rotation);
 
 							if (window->server_flags & YUTANI_WINDOW_FLAG_DIALOG_ANIMATION) {
 								double x = time_diff;
@@ -798,11 +821,37 @@ static int yutani_blit_window(yutani_globals_t * yg, yutani_server_window_t * wi
 							}
 						}
 						break;
+					case YUTANI_EFFECT_MINIMIZE:
+						{
+							frame = yutani_animation_lengths[window->anim_mode] - frame;
+						} /* fallthrough */
+					case YUTANI_EFFECT_UNMINIMIZE:
+						{
+							double time_diff = ((double)frame / (float)yutani_animation_lengths[window->anim_mode]);
+							opacity *= time_diff;
+							double t_x = -(window->x - window->icon_x) * (1.0 - time_diff);
+							double t_y = -(window->y - window->icon_y) * (1.0 - time_diff);
+							double s_x = 1.0 + (((float)window->icon_w / (float)(window->width ?: 1.0)) - 1.0) * (1.0 - time_diff);
+							double s_y = 1.0 + (((float)window->icon_h / (float)(window->height ?: 1.0)) - 1.0) * (1.0 - time_diff);
+							gfx_matrix_translate(m, t_x, t_y);
+							gfx_matrix_scale(m, s_x, s_y);
+							apply_rotation(yg, window, m, window->rotation * time_diff);
+						}
+						break;
 					default:
+						apply_rotation(yg, window, m, window->rotation);
 						break;
 				}
 			}
+		} else {
+			apply_rotation(yg, window, m, window->rotation);
 		}
+#ifdef ENABLE_BLUR_BEHIND
+		if (window->server_flags & YUTANI_WINDOW_FLAG_BLUR_BEHIND) {
+			extern void draw_sprite_transform_blur(gfx_context_t * ctx, gfx_context_t * blur_ctx, const sprite_t * sprite, gfx_matrix_t matrix, float alpha, uint8_t threshold);
+			draw_sprite_transform_blur(yg->backend_ctx, blur_ctx, &_win_sprite, m, opacity, window->alpha_threshold);
+		} else
+#endif
 		if (matrix_is_translation(m)) {
 			draw_sprite_alpha(yg->backend_ctx, &_win_sprite, m[0][2], m[1][2], opacity);
 		} else {
@@ -813,6 +862,31 @@ static int yutani_blit_window(yutani_globals_t * yg, yutani_server_window_t * wi
 	} else {
 		draw_sprite(yg->backend_ctx, &_win_sprite, window->x, window->y);
 	}
+
+#if YUTANI_DEBUG_WINDOW_BOUNDS
+	if (yg->debug_bounds) {
+		int32_t t_x, t_y;
+		int32_t s_x, s_y;
+		int32_t r_x, r_y;
+		int32_t q_x, q_y;
+
+		yutani_window_to_device(window, 0, 0, &t_x, &t_y);
+		yutani_window_to_device(window, window->width, window->height, &s_x, &s_y);
+		yutani_window_to_device(window, 0, window->height, &r_x, &r_y);
+		yutani_window_to_device(window, window->width, 0, &q_x, &q_y);
+
+		uint32_t x = alpha_blend(rgba(0,0,0,0), yutani_color_for_wid(window->wid), rgb(178,0,0));
+
+		struct TT_Contour * contour = tt_contour_start(t_x,t_y);
+		contour = tt_contour_line_to(contour, r_x,r_y);
+		contour = tt_contour_line_to(contour, s_x,s_y);
+		contour = tt_contour_line_to(contour, q_x,q_y);
+		struct TT_Shape * shape = tt_contour_finish(contour);
+		free(contour);
+		tt_path_paint(yg->backend_ctx, shape, x);
+		free(shape);
+	}
+#endif
 
 	return 0;
 }
@@ -841,7 +915,7 @@ static void yutani_post_vbox_rects(yutani_globals_t * yg) {
 
 	struct Rect * rects = (struct Rect *)(tmp+sizeof(int32_t));
 
-#define DO_WINDOW(win) if (win && !win->hidden && *count < 255 ) { \
+#define DO_WINDOW(win) if (win && !win->hidden && !win->minimized && *count < 255 ) { \
 	rects->x = (win)->x; \
 	rects->y = (win)->y; \
 	rects->xe = (win)->x + (win)->width; \
@@ -920,7 +994,15 @@ static void yutani_screenshot(yutani_globals_t * yg) {
 	yg->screenshot_frame = 0;
 
 	/* raw screenshots */
-	FILE * f = fopen("/tmp/screenshot.tga", "w");
+
+	char fname[1024];
+	struct tm * timeinfo;
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	timeinfo = localtime((time_t *)&now.tv_sec);
+	strftime(fname,1024,"/tmp/screenshot_%F_%H_%M_%S.tga",timeinfo);
+
+	FILE * f = fopen(fname, "w");
 	if (!f) {
 		TRACE("Error opening output file for screenshot.");
 		return;
@@ -984,6 +1066,27 @@ static void yutani_screenshot(yutani_globals_t * yg) {
 		}
 	}
 	fclose(f);
+
+
+	FILE * toast = fopen("/dev/pex/toast", "w");
+	fprintf(toast, "{\"icon\": \"%s\", \"body\": \"Screenshot taken.\"}", fname);
+	fclose(toast);
+
+	/* Blorp */
+	system("play /usr/share/ttk/blorp.wav &");
+}
+
+static gfx_context_t * init_graphics_with_store(gfx_context_t * base, char * store) {
+	gfx_context_t * out = malloc(sizeof(gfx_context_t));
+	out->clips = NULL;
+	out->width = base->width;
+	out->height = base->height;
+	out->stride = base->stride;
+	out->depth = base->depth;
+	out->size = base->size;
+	out->buffer = store;
+	out->backbuffer = out->buffer;
+	return out;
 }
 
 static void resize_display(yutani_globals_t * yg) {
@@ -995,6 +1098,22 @@ static void resize_display(yutani_globals_t * yg) {
 		reinit_graphics_yutani(yg->backend_ctx, yg->host_window);
 		yutani_window_resize_done(yg->host_context, yg->host_window);
 	}
+
+#ifdef ENABLE_BLUR_BEHIND
+	free(blur_ctx);
+	blur_texture = realloc(blur_texture, yg->backend_ctx->stride * yg->backend_ctx->height);
+	blur_ctx = init_graphics_with_store(yg->backend_ctx, blur_texture);
+	clip_ctx->width = yg->backend_ctx->width;
+	clip_ctx->height = yg->backend_ctx->height;
+
+	/* reinitialize extended clip context or we won't be drawing enough later... */
+	if (clip_ctx->clips && clip_ctx->clips_size) {
+		free(clip_ctx->clips);
+		clip_ctx->clips_size = 0;
+		clip_ctx->clips = NULL;
+	}
+#endif
+
 	TRACE("graphics context resized...");
 	yg->width = yg->backend_ctx->width;
 	yg->height = yg->backend_ctx->height;
@@ -1041,12 +1160,19 @@ static void redraw_windows(yutani_globals_t * yg) {
 	}
 
 	gfx_clear_clip(yg->backend_ctx);
+#ifdef ENABLE_BLUR_BEHIND
+	gfx_clear_clip(clip_ctx);
+#endif
 
 	/* If the mouse has moved, that counts as two damage regions */
 	if ((yg->last_mouse_x != tmp_mouse_x) || (yg->last_mouse_y != tmp_mouse_y)) {
 		has_updates = 2;
 		gfx_add_clip(yg->backend_ctx, yg->last_mouse_x / MOUSE_SCALE - MOUSE_OFFSET_X, yg->last_mouse_y / MOUSE_SCALE - MOUSE_OFFSET_Y, MOUSE_WIDTH, MOUSE_HEIGHT);
 		gfx_add_clip(yg->backend_ctx, tmp_mouse_x / MOUSE_SCALE - MOUSE_OFFSET_X, tmp_mouse_y / MOUSE_SCALE - MOUSE_OFFSET_Y, MOUSE_WIDTH, MOUSE_HEIGHT);
+#ifdef ENABLE_BLUR_BEHIND
+		gfx_add_clip(clip_ctx, yg->last_mouse_x / MOUSE_SCALE - MOUSE_OFFSET_X - BLUR_CLIP_MAX, yg->last_mouse_y / MOUSE_SCALE - MOUSE_OFFSET_Y - BLUR_CLIP_MAX, MOUSE_WIDTH + BLUR_CLIP_MAX * 2, MOUSE_HEIGHT + BLUR_CLIP_MAX * 2);
+		gfx_add_clip(clip_ctx, tmp_mouse_x / MOUSE_SCALE - MOUSE_OFFSET_X - BLUR_CLIP_MAX, tmp_mouse_y / MOUSE_SCALE - MOUSE_OFFSET_Y - BLUR_CLIP_MAX, MOUSE_WIDTH + BLUR_CLIP_MAX * 2, MOUSE_HEIGHT + BLUR_CLIP_MAX * 2);
+#endif
 	}
 
 	yg->last_mouse_x = tmp_mouse_x;
@@ -1056,7 +1182,18 @@ static void redraw_windows(yutani_globals_t * yg) {
 	if (yg->top_z && yg->top_z->anim_mode) mark_window(yg, yg->top_z);
 	foreach (node, yg->mid_zs) {
 		yutani_server_window_t * w = node->value;
-		if (w && w->anim_mode) mark_window(yg, w);
+		if (w && w->anim_mode) {
+			if (w->anim_mode == YUTANI_EFFECT_MINIMIZE || w->anim_mode == YUTANI_EFFECT_UNMINIMIZE) {
+				yutani_damage_rect_t * rect = malloc(sizeof(yutani_damage_rect_t));
+				rect->x = 0;
+				rect->y = 0;
+				rect->width = yg->width;
+				rect->height = yg->height;
+				list_insert(yg->update_list, rect);
+			} else {
+				mark_window(yg, w);
+			}
+		}
 	}
 	foreach (node, yg->overlay_zs) {
 		yutani_server_window_t * w = node->value;
@@ -1075,18 +1212,33 @@ static void redraw_windows(yutani_globals_t * yg) {
 		/* We add a clip region for each window in the update queue */
 		has_updates = 1;
 		gfx_add_clip(yg->backend_ctx, rect->x, rect->y, rect->width, rect->height);
+#ifdef ENABLE_BLUR_BEHIND
+		gfx_add_clip(clip_ctx, rect->x - BLUR_CLIP_MAX, rect->y - BLUR_CLIP_MAX, rect->width + BLUR_CLIP_MAX * 2, rect->height + BLUR_CLIP_MAX * 2);
+#endif
 		free(rect);
 		free(win);
 	}
 
 	/* Render */
 	if (has_updates) {
+
+#ifdef ENABLE_BLUR_BEHIND
+		/* Extend clips */
+		char * oclip = yg->backend_ctx->clips;
+		yg->backend_ctx->clips = clip_ctx->clips;
+#endif
+
 		/*
 		 * In theory, we should restrict this to windows within the clip region,
 		 * but calculating that may be more trouble than it's worth;
 		 * we also need to render windows in stacking order...
 		 */
 		yutani_blit_windows(yg);
+
+#ifdef ENABLE_BLUR_BEHIND
+		/* Restore clip context */
+		yg->backend_ctx->clips = oclip;
+#endif
 
 		/* Send VirtualBox rects */
 		yutani_post_vbox_rects(yg);
@@ -1169,6 +1321,13 @@ static void redraw_windows(yutani_globals_t * yg) {
 			free(node);
 		}
 
+		while (yg->windows_to_minimize->tail) {
+			node_t * node = list_pop(yg->windows_to_minimize);
+			window_finish_minimize(yg, node->value);
+			free(node);
+
+		}
+
 	}
 
 	if (yg->screenshot_frame) {
@@ -1190,6 +1349,7 @@ void yutani_clip_init(yutani_globals_t * yg) {
  * the whole region specified and then mark that.
  */
 static void mark_window_relative(yutani_globals_t * yg, yutani_server_window_t * window, int32_t x, int32_t y, int32_t width, int32_t height) {
+	if (window->hidden || window->minimized) return;
 	yutani_damage_rect_t * rect = malloc(sizeof(yutani_damage_rect_t));
 	yutani_server_window_t fake_window;
 
@@ -1262,7 +1422,7 @@ static void mark_window(yutani_globals_t * yg, yutani_server_window_t * window) 
  * Set a window as closed. It will be removed after rendering has completed.
  */
 static void window_mark_for_close(yutani_globals_t * yg, yutani_server_window_t * w) {
-	if (w->hidden) {
+	if (w->hidden || w->minimized) {
 		window_actually_close(yg, w);
 	} else {
 		w->anim_mode = yutani_pick_animation(w->server_flags, 1);
@@ -1284,6 +1444,29 @@ static void window_remove_from_client(yutani_globals_t * yg, yutani_server_windo
 	}
 }
 
+static void window_finish_minimize(yutani_globals_t * yg, yutani_server_window_t * w) {
+	if (w->minimized) return;
+	w->minimized = 1;
+	w->anim_mode = 0;
+	w->anim_start = 0;
+
+	unorder_window(yg,w);
+	if (w == yg->focused_window) {
+		yg->focused_window = NULL;
+		if (yg->menu_zs->tail && yg->menu_zs->tail->value) {
+			set_focused_window(yg, yg->menu_zs->tail->value);
+		} else if (yg->mid_zs->tail && yg->mid_zs->tail->value) {
+			set_focused_window(yg, yg->mid_zs->tail->value);
+		} else {
+			set_focused_window(yg, yg->bottom_z);
+		}
+	}
+
+	list_insert(yg->minimized_zs, w);
+
+	notify_subscribers(yg);
+}
+
 /**
  * Actually remove a window and free the associated resources.
  */
@@ -1293,6 +1476,14 @@ static void window_actually_close(yutani_globals_t * yg, yutani_server_window_t 
 
 	/* Remove from the general list of windows. */
 	list_remove(yg->windows, list_index_of(yg->windows, w));
+
+	if (w->minimized) {
+		node_t * n = list_find(yg->minimized_zs, w);
+		if (n) {
+			list_delete(yg->minimized_zs, n);
+			free(n);
+		}
+	}
 
 	/* Unstack the window */
 	unorder_window(yg, w);
@@ -1308,6 +1499,8 @@ static void window_actually_close(yutani_globals_t * yg, yutani_server_window_t 
 			set_focused_window(yg, yg->menu_zs->tail->value);
 		} else if (yg->mid_zs->tail && yg->mid_zs->tail->value) {
 			set_focused_window(yg, yg->mid_zs->tail->value);
+		} else {
+			set_focused_window(yg, yg->bottom_z);
 		}
 	}
 
@@ -1334,8 +1527,11 @@ static void window_actually_close(yutani_globals_t * yg, yutani_server_window_t 
  */
 static uint32_t ad_flags(yutani_globals_t * yg, yutani_server_window_t * win) {
 	uint32_t flags = win->client_flags;
-	if (win == yg->focused_window) {
+	if (win == yg->focused_window || (yg->focused_window && yg->focused_window->parent == win->wid)) {
 		flags |= 1;
+	}
+	if (win->minimized) {
+		flags |= 2;
 	}
 	return flags;
 }
@@ -1476,6 +1672,29 @@ static void window_reveal(yutani_globals_t * yg, yutani_server_window_t * window
 	window->anim_start = yutani_current_time(yg);
 }
 
+static void window_unminimize(yutani_globals_t * yg, yutani_server_window_t * window) {
+	if (!window->minimized) return;
+
+	node_t * n = list_find(yg->minimized_zs, window);
+	if (n) {
+		list_delete(yg->minimized_zs, n);
+		free(n);
+	}
+
+	list_insert(yg->mid_zs, window);
+	window->z = 1;
+
+	window->minimized = 0;
+	window->anim_mode = YUTANI_EFFECT_UNMINIMIZE;
+	window->anim_start = yutani_current_time(yg);
+}
+
+static void window_minimize(yutani_globals_t * yg, yutani_server_window_t * window) {
+	if (!window->client_length) return; /* Windows must be advertised to be minimized. */
+	window->anim_mode = YUTANI_EFFECT_MINIMIZE;
+	window->anim_start = yutani_current_time(yg);
+}
+
 /**
  * Process a key event.
  *
@@ -1512,6 +1731,12 @@ static void handle_key_event(yutani_globals_t * yg, struct yutani_msg_key_event 
 			mark_window(yg,focused);
 			focused->rotation = 0;
 			mark_window(yg,focused);
+			return;
+		}
+		if ((ke->event.action == KEY_ACTION_DOWN) &&
+			(ke->event.modifiers & KEY_MOD_LEFT_SUPER) &&
+			(ke->event.keycode == 'a')) {
+			window_minimize(yg,focused);
 			return;
 		}
 #endif
@@ -1553,6 +1778,18 @@ static void handle_key_event(yutani_globals_t * yg, struct yutani_msg_key_event 
 			(ke->event.modifiers & KEY_MOD_LEFT_SHIFT) &&
 			(ke->event.keycode == 'b')) {
 			yg->debug_bounds = (1-yg->debug_bounds);
+			return;
+		}
+#endif
+#ifdef ENABLE_BLUR_BEHIND
+		if ((ke->event.action == KEY_ACTION_DOWN) &&
+			(ke->event.modifiers & KEY_MOD_LEFT_SUPER) &&
+			(ke->event.modifiers & KEY_MOD_LEFT_SHIFT) &&
+			(ke->event.keycode == 'v')) {
+			if (focused->z != YUTANI_ZORDER_BOTTOM && focused->z != YUTANI_ZORDER_TOP) {
+				focused->server_flags ^= YUTANI_WINDOW_FLAG_BLUR_BEHIND;
+				mark_window(yg, focused);
+			}
 			return;
 		}
 #endif
@@ -1958,7 +2195,9 @@ static void handle_mouse_event(yutani_globals_t * yg, struct yutani_msg_mouse_ev
 					int32_t y_diff = yg->mouse_y / MOUSE_SCALE - (yg->mouse_window->y + yg->mouse_window->height / 2);
 					int new_r = atan2(x_diff, y_diff) * 180.0 / (-M_PI);
 					mark_window(yg, yg->mouse_window);
-					yg->mouse_window->rotation = new_r + yg->mouse_init_r;
+					/* Normalize to -179~180 range */
+					int nr = (new_r + yg->mouse_init_r + 360) % 360;
+					yg->mouse_window->rotation = nr > 180 ? nr - 360 : nr;
 					mark_window(yg, yg->mouse_window);
 				}
 			}
@@ -2071,7 +2310,9 @@ static void handle_mouse_event(yutani_globals_t * yg, struct yutani_msg_mouse_ev
 
 				mark_window(yg, yg->resizing_window);
 
-				if (!yg->resize_release_time || !(me->event.buttons & yg->resizing_button)) {
+				if (!yg->resize_release_time ||
+				    !(me->event.buttons & yg->resizing_button) ||
+				    (yg->resize_release_time && yutani_time_since(yg, yg->resize_release_time) >= 100)) {
 					yg->resize_release_time = yutani_current_time(yg);
 					yutani_msg_buildx_window_resize_alloc(response);
 					yutani_msg_buildx_window_resize(response,YUTANI_MSG_RESIZE_OFFER, yg->resizing_window->wid, yg->resizing_w, yg->resizing_h, 0, yg->resizing_window->tiled);
@@ -2208,6 +2449,14 @@ int main(int argc, char * argv[]) {
 		yg->backend_ctx = init_graphics_fullscreen_double_buffer();
 	}
 
+#ifdef ENABLE_BLUR_BEHIND
+	blur_texture = realloc(blur_texture, yg->backend_ctx->stride * yg->backend_ctx->height);
+	blur_ctx = init_graphics_with_store(yg->backend_ctx, blur_texture);
+	clip_ctx = calloc(1, sizeof(gfx_context_t));
+	clip_ctx->width = yg->backend_ctx->width;
+	clip_ctx->height = yg->backend_ctx->height;
+#endif
+
 	if (!yg->backend_ctx) {
 		free(yg);
 		TRACE("Failed to open framebuffer, bailing.");
@@ -2271,6 +2520,8 @@ int main(int argc, char * argv[]) {
 	yg->menu_zs = list_create();
 	yg->overlay_zs = list_create();
 	yg->windows_to_remove = list_create();
+	yg->windows_to_minimize = list_create();
+	yg->minimized_zs = list_create();
 
 	yg->window_subscribers = list_create();
 
@@ -2490,6 +2741,12 @@ int main(int argc, char * argv[]) {
 					struct yutani_msg_window_new_flags * wn = (void *)m->data;
 					TRACE("Client %p requested a new window (%dx%d).", p->source, wn->width, wn->height);
 					yutani_server_window_t * w = server_window_create(yg, wn->width, wn->height, p->source, m->type != YUTANI_MSG_WINDOW_NEW ? wn->flags : 0);
+
+					if (w->server_flags & YUTANI_WINDOW_FLAG_PARENT_WID) {
+						TRACE("Set parent wid of %d to %d\n", w->wid, wn->parent_wid);
+						w->parent = wn->parent_wid;
+					}
+
 					yutani_msg_buildx_window_init_alloc(response);
 					yutani_msg_buildx_window_init(response,w->wid, w->width, w->height, w->bufid);
 					pex_send(server, p->source, response->size, (char *)response);
@@ -2569,6 +2826,18 @@ int main(int argc, char * argv[]) {
 					movee->rotation = base->rotation;
 				}
 				break;
+			case YUTANI_MSG_WINDOW_SET_PARENT:
+				{
+					struct yutani_msg_window_set_parent * wsp = (void *)m->data;
+					yutani_server_window_t * movee = hashmap_get(yg->wids_to_windows, (void*)(uintptr_t)wsp->wid);
+					if (!movee) break;
+					/* XXX Should we disallow parenting to a window owned by another client?
+					 *     Validate that the window even exists?
+					 *     For now, just accept any wid, whatever. */
+					movee->parent = wsp->parent_wid;
+					notify_subscribers(yg);
+				}
+				break;
 			case YUTANI_MSG_WINDOW_CLOSE:
 				{
 					struct yutani_msg_window_close * wc = (void *)m->data;
@@ -2628,11 +2897,15 @@ int main(int argc, char * argv[]) {
 					yutani_server_window_t * w = hashmap_get(yg->wids_to_windows, (void *)(uintptr_t)wr->wid);
 					if (w) {
 						server_window_resize_finish(yg, w, wr->width, wr->height);
+						notify_subscribers(yg);
 					}
 				}
 				break;
 			case YUTANI_MSG_QUERY_WINDOWS:
 				{
+					foreach (node, yg->minimized_zs) {
+						yutani_query_result(yg, p->source, node->value);
+					}
 					yutani_query_result(yg, p->source, yg->bottom_z);
 					foreach (node, yg->mid_zs) {
 						yutani_query_result(yg, p->source, node->value);
@@ -2796,6 +3069,11 @@ int main(int argc, char * argv[]) {
 								pex_send(yg->server, w->owner, response->size, (char *)response);
 							}
 							break;
+						case YUTANI_SPECIAL_REQUEST_MINIMIZE:
+							if (w) {
+								window_minimize(yg,w);
+							}
+							break;
 						case YUTANI_SPECIAL_REQUEST_CLIPBOARD:
 							{
 								yutani_msg_buildx_clipboard_alloc(response, yg->clipboard_size);
@@ -2817,6 +3095,18 @@ int main(int argc, char * argv[]) {
 					memcpy(yg->clipboard, cb->content, yg->clipboard_size);
 					yg->clipboard[yg->clipboard_size] = '\0';
 					TRACE("Copied text to clipbard (size=%d)", yg->clipboard_size);
+				}
+				break;
+			case YUTANI_MSG_WINDOW_PANEL_SIZE:
+				{
+					struct yutani_msg_window_panel_size * ps = (void *)m->data;
+					yutani_server_window_t * w = hashmap_get(yg->wids_to_windows, (void *)(uintptr_t)ps->wid);
+					if (w) {
+						w->icon_x = ps->x;
+						w->icon_y = ps->y;
+						w->icon_w = ps->w;
+						w->icon_h = ps->h;
+					}
 				}
 				break;
 			default:

@@ -16,14 +16,7 @@
 static struct MenuList * window_menu;
 static int title_width = 0;
 static yutani_wid_t _window_menu_wid = 0;
-
-/* Update the hover-focus window */
-static void set_focused(int i) {
-	if (focused_app != i) {
-		focused_app = i;
-		redraw();
-	}
-}
+static int focused_app = -1;
 
 static void _window_menu_start_move(struct MenuEntry * self) {
 	if (!_window_menu_wid)
@@ -39,10 +32,15 @@ static void _window_menu_start_maximize(struct MenuEntry * self) {
 	yutani_focus_window(yctx, _window_menu_wid);
 }
 
+static void _window_menu_start_minimize(struct MenuEntry * self) {
+	if (!_window_menu_wid)
+		return;
+	yutani_special_request_wid(yctx, _window_menu_wid, YUTANI_SPECIAL_REQUEST_MINIMIZE);
+}
+
 static void _window_menu_close(struct MenuEntry * self) {
 	if (!_window_menu_wid)
 		return;
-	yutani_focus_window(yctx, _window_menu_wid);
 	yutani_special_request_wid(yctx, _window_menu_wid, YUTANI_SPECIAL_REQUEST_PLEASE_CLOSE);
 }
 
@@ -87,23 +85,30 @@ static int widget_draw_windowlist(struct PanelWidget * this, gfx_context_t * ctx
 				}
 			}
 
+			uint32_t text_color = this->pctx->color_text_normal;
+			if (j == focused_app) text_color = this->pctx->color_text_hilighted;
+			else if (ad->flags & 1) text_color = this->pctx->color_text_focused;
+			else if (ad->flags & 2) text_color = premultiply(rgba(_RED(this->pctx->color_text_normal),_GRE(this->pctx->color_text_normal),_BLU(this->pctx->color_text_normal),127));
+
 			if (title_width >= MIN_TEXT_WIDTH) {
 				/* Ellipsifiy the title */
-				char * s = ellipsify(ad->name, 14, font, title_width - 4, NULL);
+				char * s = tt_ellipsify(ad->name, 14, this->pctx->font, title_width - 4, NULL);
 				sprite_t * icon = icon_get_48(ad->icon);
-				gfx_context_t * subctx = init_graphics_subregion(ctx, i, 0, w, ctx->height);
+				gfx_context_t * subctx = init_graphics_subregion(ctx, i, 0, w, ctx->height-1);
 				draw_sprite_scaled_alpha(subctx, icon, w - 48 - 2, 0, 48, 48, (ad->flags & 1) ? 1.0 : 0.7);
-				tt_draw_string_shadow(subctx, font, s, 14, 2, TEXT_Y_OFFSET, (j == focused_app) ? HILIGHT_COLOR : (ad->flags & 1) ? FOCUS_COLOR : TEXT_COLOR, rgb(0,0,0), 4);
+				tt_draw_string_shadow(subctx, this->pctx->font, s, 14, 2, 6, text_color, rgb(0,0,0), 4);
 				free(subctx);
 				free(s);
 			} else {
 				sprite_t * icon = icon_get_16(ad->icon);
-				gfx_context_t * subctx = init_graphics_subregion(ctx, i, 0, w, ctx->height);
+				gfx_context_t * subctx = init_graphics_subregion(ctx, i, 0, w, ctx->height-1);
 				draw_sprite_scaled(subctx, icon, 6, 6, 16, 16);
 				free(subctx);
 			}
 
 			ad->left = this->left + i;
+
+			yutani_window_panel_size(yctx, ad->wid, ad->left + this->pctx->basewindow->x, this->pctx->basewindow->y, w, ctx->height);
 
 			j++;
 			i += w;
@@ -134,23 +139,33 @@ static int widget_rightclick_windowlist(struct PanelWidget * this, struct yutani
 	return 0;
 }
 
+/* Update the hover-focus window */
+static int set_focused(int i) {
+	if (focused_app != i) {
+		focused_app = i;
+		return 1;
+	}
+	return 0;
+}
+
 
 static int widget_move_windowlist(struct PanelWidget * this, struct yutani_msg_window_mouse_event * evt) {
 	int found = 0;
 	int i = 0;
+	int should_redraw = 0;
 
 	foreach(node, window_list) {
 		struct window_ad * ad = node->value;
 		if (evt->new_x >= ad->left && evt->new_x < ad->left + TOTAL_CELL_WIDTH) {
 			found = 1;
-			set_focused(i);
+			should_redraw |= set_focused(i);
 			break;
 		}
 		i++;
 	}
 
 	if (!found) {
-		set_focused(-1);
+		should_redraw |= set_focused(-1);
 	}
 
 	int scroll_direction = 0;
@@ -184,13 +199,12 @@ static int widget_move_windowlist(struct PanelWidget * this, struct yutani_msg_w
 		}
 	}
 
-	return 1;
+	return should_redraw;
 }
 
 static int widget_leave_windowlist(struct PanelWidget * this, struct yutani_msg_window_mouse_event * evt) {
 	this->highlighted = 0;
-	set_focused(-1);
-	return 1;
+	return set_focused(-1);
 }
 
 static int widget_onkey_windowlist(struct PanelWidget * this, struct yutani_msg_key_event * ke) {
@@ -211,6 +225,7 @@ struct PanelWidget * widget_init_windowlist(void) {
 	window_menu = menu_create();
 	window_menu->flags |= MENU_FLAG_BUBBLE_LEFT;
 	menu_insert(window_menu, menu_create_normal(NULL, NULL, "Maximize", _window_menu_start_maximize));
+	menu_insert(window_menu, menu_create_normal(NULL, NULL, "Minimize", _window_menu_start_minimize));
 	menu_insert(window_menu, menu_create_normal(NULL, NULL, "Move", _window_menu_start_move));
 	menu_insert(window_menu, menu_create_separator());
 	menu_insert(window_menu, menu_create_normal(NULL, NULL, "Close", _window_menu_close));

@@ -200,14 +200,14 @@ static elf_t * open_object(const char * path) {
 
 	/* Initialize a fresh object object. */
 	elf_t * object = malloc(sizeof(elf_t));
-	memset(object, 0, sizeof(elf_t));
-	hashmap_set(objects_map, (void*)path, object);
 
 	/* Really unlikely... */
 	if (!object) {
 		last_error = "Could not allocate space.";
 		return NULL;
 	}
+	memset(object, 0, sizeof(elf_t));
+	hashmap_set(objects_map, (void*)path, object);
 
 	object->file = f;
 
@@ -402,6 +402,8 @@ static int need_symbol_for_type(unsigned int type) {
 		case R_X86_64_JUMP_SLOT:
 		case R_X86_64_8:
 		case R_X86_64_TPOFF64:
+		case R_X86_64_DTPMOD64:
+		case R_X86_64_DTPOFF64:
 			return 1;
 		default:
 			return 0;
@@ -412,6 +414,7 @@ static int need_symbol_for_type(unsigned int type) {
 		case 1025:
 		case 1026:
 		case 1030:
+		case 1031:
 		case 257:
 			return 1;
 		default:
@@ -419,6 +422,11 @@ static int need_symbol_for_type(unsigned int type) {
 	}
 
 #endif
+}
+
+__attribute__((unused))
+static size_t __tlsdesc_static(size_t * a) {
+	return a[1];
 }
 
 /* Apply ELF relocations */
@@ -480,6 +488,11 @@ static int object_relocate(elf_t * object) {
 						x = (uintptr_t)hashmap_get(dumb_symbol_table, symname);
 					} else {
 						/* This isn't fatal, but do log a message if debugging is enabled. */
+						if ((sym->st_info >> 4) != STB_WEAK) {
+							extern char * _argv_0;
+							fprintf(stderr, "%s: undefined symbol %s\n",
+								_argv_0, symname);
+						}
 						TRACE_LD("Symbol not found: %s", symname);
 						x = 0x0;
 					}
@@ -523,8 +536,15 @@ static int object_relocate(elf_t * object) {
 						memcpy((void *)(table->r_offset + object->base), &x, sizeof(uintptr_t));
 						break;
 					case R_X86_64_DTPMOD64:
+						if (!hashmap_has(tls_map, symname)) { fprintf(stderr, "tls entry is unallocated?\n"); break; }
+						x = 0;
+						memcpy((void *)(table->r_offset + object->base), &x, sizeof(uintptr_t));
 						break;
 					case R_X86_64_DTPOFF64:
+						if (!hashmap_has(tls_map, symname)) { fprintf(stderr, "tls entry is unallocated?\n"); break; }
+						x = table->r_addend;
+						x += (size_t)hashmap_get(tls_map, symname);
+						memcpy((void *)(table->r_offset + object->base), &x, sizeof(uintptr_t));
 						break;
 #elif defined(__aarch64__)
 					case 1024: /* COPY */
@@ -562,6 +582,24 @@ static int object_relocate(elf_t * object) {
 						}
 						memcpy((void *)(table->r_offset + object->base), &x, sizeof(uintptr_t));
 						break;
+					case 1031: {
+						if (symbol) {
+							if (!hashmap_has(tls_map, symname)) {
+								fprintf(stderr, "Warning: Don't know where to get %s (symbol %d) from TLS\n", symname, symbol);
+								break;
+							}
+							x += *((ssize_t *)(table->r_offset + object->base));
+							x += (size_t)hashmap_get(tls_map, symname);
+						} else {
+							/* local tls descriptor? no symbol? idk what to do with this, hope it works */
+							x = current_tls_offset;
+							current_tls_offset += 8*4; /* idk, alignment I guess */
+						}
+						uintptr_t func = (uintptr_t)&__tlsdesc_static;
+						memcpy((void *)(table->r_offset + object->base), &func, sizeof(uintptr_t));
+						memcpy((void *)(table->r_offset + object->base + sizeof(uintptr_t)), &x, sizeof(uintptr_t));
+						break;
+					}
 #else
 # error "unsupported"
 #endif

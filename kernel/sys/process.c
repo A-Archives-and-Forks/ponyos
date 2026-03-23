@@ -65,19 +65,33 @@ static spin_lock_t wait_lock_tmp = { 0 };
 static spin_lock_t sleep_lock = { 0 };
 static spin_lock_t reap_lock = { 0 };
 
-void update_process_times(int includeSystem) {
+/**
+ * Update both the total time and the system time when switching to a new thread
+ * or exiting the current thread.
+ */
+void update_process_times(void) {
 	uint64_t pTime = arch_perf_timer();
 	if (this_core->current_process->time_in && this_core->current_process->time_in < pTime) {
 		this_core->current_process->time_total +=  pTime - this_core->current_process->time_in;
 	}
 	this_core->current_process->time_in = 0;
 
-	if (includeSystem) {
-		if (this_core->current_process->time_switch && this_core->current_process->time_switch < pTime) {
-			this_core->current_process->time_sys += pTime - this_core->current_process->time_switch;
-		}
-		this_core->current_process->time_switch = 0;
+	if (this_core->current_process->time_switch && this_core->current_process->time_switch < pTime) {
+		this_core->current_process->time_sys += pTime - this_core->current_process->time_switch;
 	}
+	this_core->current_process->time_switch = 0;
+}
+
+/**
+ * Add time spent in kernel to time_sys when returning to userspace, such as through
+ * an interrupt return or entry into a signal handler.
+ */
+void update_process_times_on_exit(void) {
+	uint64_t pTime = arch_perf_timer();
+	if (this_core->current_process->time_switch && this_core->current_process->time_switch < pTime) {
+		this_core->current_process->time_sys += pTime - this_core->current_process->time_switch;
+	}
+	this_core->current_process->time_switch = 0;
 }
 
 #define must_have_lock(lck) if (lck.owner != this_core->cpu_id+1) { arch_fatal_prepare(); printf("Failed lock check.\n"); arch_dump_traceback(); arch_fatal(); }
@@ -108,7 +122,7 @@ void update_process_times(int includeSystem) {
  */
 void switch_next(void) {
 	this_core->previous_process = this_core->current_process;
-	update_process_times(1);
+	update_process_times();
 
 	/* Get the next available process, discarded anything in the queue
 	 * marked as finished. */
@@ -123,11 +137,10 @@ void switch_next(void) {
 	mmu_set_directory(this_core->current_process->thread.page_directory->directory);
 	arch_set_kernel_stack(this_core->current_process->image.stack);
 
-	if ((this_core->current_process->flags & PROC_FLAG_FINISHED) ||  (!this_core->current_process->signal_queue)) {
+	if (this_core->current_process->flags & PROC_FLAG_FINISHED) {
 		arch_fatal_prepare();
 		printf("Should not have this process...\n");
 		if (this_core->current_process->flags & PROC_FLAG_FINISHED) printf("It is marked finished.\n");
-		if (!this_core->current_process->signal_queue) printf("It doesn't have a signal queue.\n");
 		arch_dump_traceback();
 		arch_fatal();
 		__builtin_unreachable();
@@ -142,8 +155,6 @@ void switch_next(void) {
 	arch_restore_context(&this_core->current_process->thread);
 	__builtin_unreachable();
 }
-
-extern void * _ret_from_preempt_source;
 
 /**
  * @brief Yield the processor to the next available task.
@@ -160,7 +171,7 @@ void switch_task(uint8_t reschedule) {
 	/* switch_task() called but the scheduler isn't enabled? Resume... this is probably a bug. */
 	if (!this_core->current_process) return;
 
-	if (this_core->current_process == this_core->kernel_idle_task && __builtin_return_address(0) != &_ret_from_preempt_source) {
+	if (this_core->current_process == this_core->kernel_idle_task) {
 		arch_fatal_prepare();
 		printf("Context switch from kernel_idle_task triggered from somewhere other than pre-emption source. Halting.\n");
 		printf("This generally means that a driver responding to interrupts has attempted to yield in its interrupt context.\n");
@@ -240,6 +251,26 @@ int is_valid_process(process_t * process) {
 }
 
 /**
+ * @brief Grow the FD table for a process by doubling its capacity.
+ */
+static void process_fds_grow(process_t * proc) {
+	proc->fds->capacity *= 2;
+	proc->fds->entries = realloc(proc->fds->entries, sizeof(fs_node_t *) * proc->fds->capacity);
+	proc->fds->modes   = realloc(proc->fds->modes,   sizeof(int) * proc->fds->capacity);
+	proc->fds->offsets = realloc(proc->fds->offsets, sizeof(uint64_t) * proc->fds->capacity);
+}
+
+/**
+ * @brief Duplicate a file descriptor to a new table entry.
+ */
+static void process_fds_copy(process_t * proc, long src, long dest) {
+	proc->fds->entries[dest] = proc->fds->entries[src];
+	proc->fds->modes[dest] = proc->fds->modes[src];
+	proc->fds->offsets[dest] = proc->fds->offsets[src];
+	open_fs(proc->fds->entries[dest], 0);
+}
+
+/**
  * @brief Allocate a new file descriptor.
  *
  * Adds a new entry to the file descriptor table for @p proc
@@ -265,10 +296,7 @@ unsigned long process_append_fd(process_t * proc, fs_node_t * node) {
 	}
 	/* No gaps, expand */
 	if (proc->fds->length == proc->fds->capacity) {
-		proc->fds->capacity *= 2;
-		proc->fds->entries = realloc(proc->fds->entries, sizeof(fs_node_t *) * proc->fds->capacity);
-		proc->fds->modes   = realloc(proc->fds->modes,   sizeof(int) * proc->fds->capacity);
-		proc->fds->offsets = realloc(proc->fds->offsets, sizeof(uint64_t) * proc->fds->capacity);
+		process_fds_grow(proc);
 	}
 	proc->fds->entries[proc->fds->length] = node;
 	/* modes, offsets must be set by caller */
@@ -277,6 +305,59 @@ unsigned long process_append_fd(process_t * proc, fs_node_t * node) {
 	proc->fds->length++;
 	spin_unlock(proc->fds->lock);
 	return proc->fds->length-1;
+}
+
+/**
+ * @brief Duplicate a file descriptor to a minimum value.
+ *
+ * Duplicate the file descriptor at @c oldfd to a new file descriptor
+ * with a number of a least @c newfd - always allocating a new
+ * file descriptor in the process.
+ *
+ * If the current table can not hold @c newfd then the table is
+ * expanded and any unused entries are left empty and will
+ * be filled by @c process_append_fd normally.
+ *
+ * @param proc Process to modify.
+ * @param oldfd File descriptor to copy from.
+ * @param newfd Minimum value of new file descriptor.
+ * @returns The actual newly allocated file descriptor.
+ */
+long process_fd_dup_least(process_t * proc, long oldfd, long newfd) {
+	spin_lock(proc->fds->lock);
+
+	/* Ensure there is at least enough space for for newfd itself */
+	while (proc->fds->capacity <= (unsigned long)newfd) {
+		process_fds_grow(proc);
+	}
+
+	/* Then ensure length is at least newfds */
+	while (proc->fds->length <= (unsigned long)newfd) {
+		proc->fds->entries[proc->fds->length] = NULL;
+		proc->fds->length++;
+	}
+
+	/* Then check if anything is available already */
+	for (size_t i = newfd; i < proc->fds->length; ++i) {
+		if (proc->fds->entries[i] == NULL) {
+			/* Found a hit, copy */
+			process_fds_copy(proc, oldfd, i);
+			spin_unlock(proc->fds->lock);
+			return i;
+		}
+	}
+
+	/* Otherwise we need to keep expanding */
+	if (proc->fds->length == proc->fds->capacity) {
+		process_fds_grow(proc);
+	}
+
+	long i = proc->fds->length;
+	process_fds_copy(proc, oldfd, i);
+	proc->fds->length++;
+	spin_unlock(proc->fds->lock);
+
+	return i;
 }
 
 /**
@@ -303,15 +384,7 @@ pid_t get_next_pid(void) {
 static void _kidle(void) {
 	while (1) {
 		arch_pause();
-	}
-}
-
-static void _kburn(void) {
-	while (1) {
-		arch_pause();
-#ifndef __aarch64__
 		switch_next();
-#endif
 	}
 }
 
@@ -348,7 +421,7 @@ process_t * spawn_kidle(int bsp) {
 		MMU_FLAG_KERNEL);
 
 	/* TODO arch_initialize_context(uintptr_t) ? */
-	idle->thread.context.ip = bsp ? (uintptr_t)&_kidle : (uintptr_t)&_kburn;
+	idle->thread.context.ip = (uintptr_t)&_kidle;
 	idle->thread.context.sp = idle->image.stack;
 	idle->thread.context.bp = idle->image.stack;
 
@@ -356,7 +429,6 @@ process_t * spawn_kidle(int bsp) {
 	 *       Can we make sure these are never referenced and not allocate them? */
 	idle->wait_queue = list_create("process wait queue (kidle)",idle);
 	idle->shm_mappings = list_create("process shm mappings (kidle)",idle);
-	idle->signal_queue = list_create("process signal queue (kidle)",idle);
 	gettimeofday(&idle->start, NULL);
 	idle->thread.page_directory = malloc(sizeof(page_directory_t));
 	idle->thread.page_directory->refcount = 1;
@@ -406,7 +478,6 @@ process_t * spawn_init(void) {
 	init->flags         = PROC_FLAG_STARTED | PROC_FLAG_RUNNING;
 	init->wait_queue    = list_create("process wait queue (init)", init);
 	init->shm_mappings  = list_create("process shm mapping (init)", init);
-	init->signal_queue  = list_create("process signal queue (init)", init);
 
 	init->sched_node.prev = NULL;
 	init->sched_node.next = NULL;
@@ -495,7 +566,6 @@ process_t * spawn_process(volatile process_t * parent, int flags) {
 
 	proc->wait_queue   = list_create("process wait queue",proc);
 	proc->shm_mappings = list_create("process shm mappings",proc);
-	proc->signal_queue = list_create("process signal queue",proc);
 
 	proc->sched_node.value = proc;
 	proc->sleep_node.value = proc;
@@ -936,10 +1006,7 @@ long process_move_fd(process_t * proc, long src, long dest) {
 	}
 	if (proc->fds->entries[dest] != proc->fds->entries[src]) {
 		close_fs(proc->fds->entries[dest]);
-		proc->fds->entries[dest] = proc->fds->entries[src];
-		proc->fds->modes[dest] = proc->fds->modes[src];
-		proc->fds->offsets[dest] = proc->fds->offsets[src];
-		open_fs(proc->fds->entries[dest], 0);
+		process_fds_copy(proc, src, dest);
 	}
 	return dest;
 }
@@ -1000,9 +1067,12 @@ int waitpid(int pid, int * status, int options) {
 					candidate = child;
 					break;
 				}
-				if ((options & WSTOPPED) && child->flags & PROC_FLAG_SUSPENDED) {
-					candidate = child;
-					break;
+				if ((child->flags & PROC_FLAG_SUSPENDED) && ((child->status & 0xFF) == 0x7F)) {
+					int reason = (child->status >> 16) & 0xFF;
+					if ((options & WSTOPPED) || (reason == 0xFF && (options & WUNTRACED))) {
+						candidate = child;
+						break;
+					}
 				}
 			}
 		}
@@ -1031,6 +1101,7 @@ int waitpid(int pid, int * status, int options) {
 			if (status) {
 				*status = candidate->status;
 			}
+			candidate->status &= ~0xFF;
 			int pid = candidate->id;
 			if (is_parent && (candidate->flags & PROC_FLAG_FINISHED)) {
 				while (*((volatile int *)&candidate->flags) & PROC_FLAG_RUNNING);
@@ -1082,7 +1153,7 @@ int process_wait_nodes(process_t * process,fs_node_t * nodes[], int timeout) {
 		do {
 			int result = selectcheck_fs(*n);
 			if (result < 0) {
-				return -1;
+				return -EBADF;
 			}
 			if (result == 0) {
 				return index;
@@ -1093,7 +1164,7 @@ int process_wait_nodes(process_t * process,fs_node_t * nodes[], int timeout) {
 	}
 
 	if (timeout == 0) {
-		return -2;
+		return index;
 	}
 
 	n = nodes;
@@ -1153,7 +1224,7 @@ void process_awaken_signal(process_t * process) {
 	spin_lock(sleep_lock);
 	spin_lock(process->sched_lock);
 	if (process->node_waits) {
-		process_awaken_from_fswait(process, -1);
+		process_awaken_from_fswait(process, -EINTR);
 	} else {
 		spin_unlock(process->sched_lock);
 	}
@@ -1216,8 +1287,6 @@ void task_exit(int retval) {
 	/* free whatever we can */
 	list_free(this_core->current_process->wait_queue);
 	free(this_core->current_process->wait_queue);
-	list_free(this_core->current_process->signal_queue);
-	free(this_core->current_process->signal_queue);
 	free(this_core->current_process->wd_name);
 	if (this_core->current_process->node_waits) {
 		list_free(this_core->current_process->node_waits);
@@ -1264,7 +1333,7 @@ void task_exit(int retval) {
 		spin_unlock(this_core->current_process->wait_lock);
 	}
 
-	update_process_times(1);
+	update_process_times();
 
 	process_t * parent = process_get_parent((process_t *)this_core->current_process);
 	__sync_or_and_fetch(&this_core->current_process->flags, PROC_FLAG_FINISHED);
@@ -1300,6 +1369,9 @@ pid_t fork(void) {
 	new_proc->thread.page_directory->refcount = 1;
 	new_proc->thread.page_directory->directory = directory;
 	spin_init(new_proc->thread.page_directory->lock);
+
+	memcpy(new_proc->signals, parent->signals, sizeof(struct signal_config) * (NUMSIGNALS+1));
+	new_proc->blocked_signals = parent->blocked_signals;
 
 	struct regs r;
 	memcpy(&r, parent->syscall_registers, sizeof(struct regs));
@@ -1339,6 +1411,8 @@ pid_t clone(uintptr_t new_stack, uintptr_t thread_func, uintptr_t arg) {
 	spin_lock(new_proc->thread.page_directory->lock);
 	new_proc->thread.page_directory->refcount++;
 	spin_unlock(new_proc->thread.page_directory->lock);
+	memcpy(new_proc->signals, parent->signals, sizeof(struct signal_config) * (NUMSIGNALS+1));
+	new_proc->blocked_signals = parent->blocked_signals;
 
 	struct regs r;
 	memcpy(&r, parent->syscall_registers, sizeof(struct regs));
@@ -1417,7 +1491,6 @@ process_t * spawn_worker_thread(void (*entrypoint)(void * argp), const char * na
 
 	proc->wait_queue   = list_create("worker thread wait queue",proc);
 	proc->shm_mappings = list_create("worker thread shm mappings",proc);
-	proc->signal_queue = list_create("worker thread signal queue",proc);
 
 	proc->sched_node.value = proc;
 	proc->sleep_node.value = proc;

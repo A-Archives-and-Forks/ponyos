@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <string.h>
 #include <syscall.h>
@@ -9,7 +10,7 @@
 DEFN_SYSCALL3(readdir, SYS_READDIR, int, int, void *);
 
 DIR * opendir (const char * dirname) {
-	int fd = open(dirname, O_RDONLY);
+	int fd = open(dirname, O_RDONLY|O_DIRECTORY);
 	if (fd < 0) {
 		/* errno was set by open */
 		return NULL;
@@ -47,3 +48,32 @@ struct dirent * readdir (DIR * dirp) {
 
 	return &ent;
 }
+
+long telldir(DIR * dirp) {
+	return (long)dirp->cur_entry;
+}
+
+void rewinddir(DIR * dirp) {
+	dirp->cur_entry = -1;
+}
+
+void seekdir(DIR * dirp, long loc) {
+	dirp->cur_entry = loc;
+}
+
+struct dirent32 {
+	unsigned int d_ino;
+	char d_name[256];
+};
+
+struct dirent32 * readdir32 (DIR * dirp) {
+	static struct dirent32 ent;
+	struct dirent* big = readdir(dirp);
+	if (!big) return NULL;
+
+	ent.d_ino = big->d_ino;
+	memcpy(ent.d_name,big->d_name,sizeof(ent.d_name));
+	return &ent;
+}
+
+struct dirent32 * readdir32 (DIR * dirp) __asm__("readdir");

@@ -31,8 +31,8 @@
 #define REG_DSPASTRIDE    0x70188
 #define REG_DSPASURF      0x7019c
 
-extern uint32_t lfb_resolution_s;
 extern fs_node_t * lfb_device;
+extern int lfb_use_write_combining;
 static uintptr_t ctrl_regs = 0;
 
 static uint32_t i965_mmio_read(uint32_t reg) {
@@ -72,9 +72,12 @@ static void i965_modeset(uint16_t x, uint16_t y) {
 	lfb_resolution_y = y;
 	lfb_resolution_b = 32;
 	lfb_resolution_s = i965_mmio_read(REG_DSPASTRIDE);
-	lfb_device->length  = lfb_resolution_s * lfb_resolution_y;
-
+	lfb_memsize = lfb_resolution_s * lfb_resolution_y;
+	lfb_device->length  = lfb_memsize;
 }
+
+extern void fbterm_draw_logo(void);
+extern void fbterm_reset(void);
 
 static void setup_framebuffer(uint32_t pcidev) {
 	/* Map BAR space for the control registers */
@@ -88,6 +91,19 @@ static void setup_framebuffer(uint32_t pcidev) {
 
 	lfb_resolution_impl = i965_modeset;
 	lfb_set_resolution(1440,900);
+
+	lfb_use_write_combining = 1;
+
+	/* Normally we don't clear the screen on mode set, but we should do it here */
+	memset(lfb_vid_memory, 0, lfb_memsize);
+
+	/* Redraw the boot logo; if we were loaded by userspace, it'll probably
+	 * be overwritten pretty quickly by the compositor? But whatever... */
+	fbterm_reset();
+	fbterm_draw_logo();
+
+	/* Helpful to know why the console text got cleared */
+	dprintf("i965: video configured for %u x %u\n", lfb_resolution_x, lfb_resolution_y);
 }
 
 static void find_intel(uint32_t device, uint16_t v, uint16_t d, void * extra) {

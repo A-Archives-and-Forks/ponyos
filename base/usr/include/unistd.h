@@ -2,7 +2,6 @@
 
 #include <_cheader.h>
 #include <stddef.h>
-#include <stdint.h>
 #include <sys/types.h>
 
 _Begin_C_Header
@@ -68,6 +67,7 @@ extern int unlink(const char * pathname);
 /* Unimplemented stubs */
 extern int rmdir(const char *pathname); /* TODO  rm probably just works */
 extern int chown(const char * pathname, uid_t owner, gid_t group);
+extern int fchown(int fd, uid_t owner, gid_t group);
 
 extern char * getlogin(void);
 extern char * ttyname(int fd);
@@ -96,14 +96,25 @@ extern pid_t getpgrp(void);
 
 extern unsigned int alarm(unsigned int seconds);
 
+#ifndef intptr_t
+# if defined(__PTRDIFF_TYPE__)
+typedef signed __PTRDIFF_TYPE__ intptr_t;
+# else
+typedef signed long intptr_t;
+# endif
+#endif
 extern void *sbrk(intptr_t increment);
 
 extern void sync(void);
 extern int truncate(const char *, off_t);
+extern int ftruncate(int, off_t);
 
 #define _PC_PATH_MAX 1
 extern long pathconf(const char *path, int name);
 
 extern int getgroups(int size, gid_t list[]);
+
+ssize_t pread(int fd, void *buf, size_t count, off_t offset);
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
 
 _End_C_Header

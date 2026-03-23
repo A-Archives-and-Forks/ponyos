@@ -24,6 +24,7 @@ __attribute__((used))
 __attribute__((naked))
 static void __ap_bootstrap(void) {
 	asm volatile (
+		".section .shit\n"
 		".code16\n"
 		".org 0x0\n"
 		".global _ap_bootstrap_start\n"
@@ -34,8 +35,7 @@ static void __ap_bootstrap(void) {
 		"mov %%eax, %%cr4\n"
 
 		/* Kernel base PML4 */
-		".global init_page_region\n"
-		"mov $init_page_region, %%edx\n"
+		"mov $0x77777777, %%edx\n"
 		"mov %%edx, %%cr3\n"
 
 		/* Set LME */
@@ -52,7 +52,7 @@ static void __ap_bootstrap(void) {
 		"addr32 lgdtl %%cs:_ap_bootstrap_gdtp-_ap_bootstrap_start\n"
 
 		/* Jump... */
-		"data32 jmp $0x08,$ap_premain\n"
+		"data32 jmp $0x08,$0x5A5A5A5A\n"
 
 		".global _ap_bootstrap_gdtp\n"
 		".align 16\n"
@@ -60,21 +60,30 @@ static void __ap_bootstrap(void) {
 		".word 0\n"
 		".quad 0\n"
 
+		".global _ap_bootstrap_end\n"
+		"_ap_bootstrap_end:\n"
+		".section .text\n"
+		: : : "memory"
+	);
+}
+
+__attribute__((used))
+__attribute__((naked))
+static void __ap_bootstrap_landing(void) {
+	asm volatile (
 		".code64\n"
 		".align 16\n"
-		"ap_premain:\n"
+		".global _ap_premain\n"
+		"_ap_premain:\n"
 		"mov $0x10, %%ax\n"
 		"mov %%ax, %%ds\n"
 		"mov %%ax, %%ss\n"
-		"mov $0x2b, %%ax\n"
+		"mov $0x33, %%ax\n" /* TSS offset in gdt */
 		"ltr %%ax\n"
 		".extern _ap_stack_base\n"
-		"mov _ap_stack_base,%%rsp\n"
+		"mov _ap_stack_base(%%rip),%%rsp\n"
 		".extern ap_main\n"
 		"callq ap_main\n"
-
-		".global _ap_bootstrap_end\n"
-		"_ap_bootstrap_end:\n"
 		: : : "memory"
 	);
 }
@@ -82,6 +91,7 @@ static void __ap_bootstrap(void) {
 extern char _ap_bootstrap_start[];
 extern char _ap_bootstrap_end[];
 extern char _ap_bootstrap_gdtp[];
+extern char _ap_premain[];
 extern size_t arch_cpu_mhz(void);
 extern void gdt_copy_to_trampoline(int ap, char * trampoline);
 extern void arch_set_core_base(uintptr_t base);
@@ -155,6 +165,37 @@ void load_processor_info(void) {
 		cpuid(0x80000004, brand[8], brand[9], brand[10], brand[11]);
 		memcpy(processor_local_data[this_core->cpu_id].cpu_model_name, brand, 48);
 	}
+
+	extern void syscall_entry(void);
+	uint32_t efer_hi, efer_lo;
+	asm volatile ("rdmsr" : "=d"(efer_hi), "=a"(efer_lo) : "c"(0xc0000080));    /* Read current EFER */
+	asm volatile ("wrmsr" : : "c"(0xc0000080), "d"(efer_hi), "a"(efer_lo | 1)); /* Enable SYSCALL/SYSRET in EFER */
+	asm volatile ("wrmsr" : : "c"(0xC0000081), "d"(0x1b0008), "a"(0));          /* Set segment bases in STAR */
+	asm volatile ("wrmsr" : : "c"(0xC0000082),                                  /* Set SYSCALL entry point in LSTAR */
+	              "d"((uintptr_t)&syscall_entry >> 32),
+	              "a"((uintptr_t)&syscall_entry & 0xFFFFffff));
+	asm volatile ("wrmsr" : : "c"(0xC0000084), "d"(0), "a"(0x700));             /* SFMASK: Direction flag, interrupt flag, trap flag are all cleared */
+}
+
+static void lapic_timer_initialize(void) {
+	/* Enable our spurious vector register */
+	*((volatile uint32_t*)(lapic_final + 0x0F0)) = 0x127;
+	*((volatile uint32_t*)(lapic_final + 0x320)) = 0x7b;
+	*((volatile uint32_t*)(lapic_final + 0x3e0)) = 1;
+
+	/* Time our APIC timer against the TSC */
+	uint64_t before = arch_perf_timer();
+	*((volatile uint32_t*)(lapic_final + 0x380)) = 1000000;
+	while (*((volatile uint32_t*)(lapic_final + 0x390)));
+	uint64_t after = arch_perf_timer();
+
+	uint64_t ms = (after-before)/arch_cpu_mhz();
+	uint64_t target = 10000000000UL / ms;
+
+	/* Enable our APIC timer to send periodic wakeup signals */
+	*((volatile uint32_t*)(lapic_final + 0x3e0)) = 1;
+	*((volatile uint32_t*)(lapic_final + 0x320)) = 0x7b | 0x20000;
+	*((volatile uint32_t*)(lapic_final + 0x380)) = target;
 }
 
 /**
@@ -182,25 +223,6 @@ void ap_main(void) {
 	fpu_initialize();
 	pat_initialize();
 
-	/* Enable our spurious vector register */
-	*((volatile uint32_t*)(lapic_final + 0x0F0)) = 0x127;
-	*((volatile uint32_t*)(lapic_final + 0x320)) = 0x7b;
-	*((volatile uint32_t*)(lapic_final + 0x3e0)) = 1;
-
-	/* Time our APIC timer against the TSC */
-	uint64_t before = arch_perf_timer();
-	*((volatile uint32_t*)(lapic_final + 0x380)) = 1000000;
-	while (*((volatile uint32_t*)(lapic_final + 0x390)));
-	uint64_t after = arch_perf_timer();
-
-	uint64_t ms = (after-before)/arch_cpu_mhz();
-	uint64_t target = 10000000000UL / ms;
-
-	/* Enable our APIC timer to send periodic wakeup signals */
-	*((volatile uint32_t*)(lapic_final + 0x3e0)) = 1;
-	*((volatile uint32_t*)(lapic_final + 0x320)) = 0x7b | 0x20000;
-	*((volatile uint32_t*)(lapic_final + 0x380)) = target;
-
 	/* Set our pml pointers */
 	this_core->current_pml = &init_page_region[0];
 
@@ -213,6 +235,8 @@ void ap_main(void) {
 
 	/* Inform BSP it can continue. */
 	_ap_startup_flag = 1;
+
+	lapic_timer_initialize();
 
 	/* Enter scheduler */
 	switch_next();
@@ -346,7 +370,7 @@ void smp_initialize(void) {
 	/* Did we still not find our table? */
 	if (!good) {
 		dprintf("smp: No RSD PTR found\n");
-		return;
+		goto _pit_fallback;
 	}
 
 	/* Map the ACPI RSDP */
@@ -362,11 +386,11 @@ void smp_initialize(void) {
 	/* Did the checksum fail? */
 	if (check != 0 && !args_present("noacpichecksum")) {
 		dprintf("smp: Bad checksum on RSDP (add 'noacpichecksum' to ignore this)\n");
-		return; /* bad checksum */
+		goto _pit_fallback; /* bad checksum */
 	}
 
 	/* Was SMP disabled by a commandline flag? */
-	if (args_present("nosmp")) return;
+	if (args_present("nosmp")) goto _pit_fallback;
 
 	/* Map the RSDT from the address given by the RSDP */
 	struct rsdt * rsdt = mmu_map_from_physical(rsdp->rsdt_address);
@@ -399,18 +423,20 @@ void smp_initialize(void) {
 	}
 
 _toomany:
-	processor_count = cores;
-
-	if (!lapic_base) return;
+	if (!lapic_base) goto _pit_fallback;
 
 	/* Allocate a virtual address with which we can poke the lapic */
 	lapic_final = (uintptr_t)mmu_map_mmio_region(lapic_base, 0x1000);
+	lapic_timer_initialize();
 
 	if (cores <= 1) return;
 
 	/* Get a page we can backup the previous contents of the bootstrap target page to, as it probably has mmap crap in multiboot2 */
 	uintptr_t tmp_space = mmu_allocate_a_frame() << 12;
 	memcpy(mmu_map_from_physical(tmp_space), mmu_map_from_physical(0x1000), 0x1000);
+
+	*(uint32_t*)(&_ap_bootstrap_start[0xb])  = (uintptr_t)&init_page_region;
+	*(uint32_t*)(&_ap_bootstrap_start[0x37]) = (uintptr_t)&_ap_premain;
 
 	/* Map the bootstrap code */
 	memcpy(mmu_map_from_physical(0x1000), &_ap_bootstrap_start, (uintptr_t)&_ap_bootstrap_end - (uintptr_t)&_ap_bootstrap_start);
@@ -435,6 +461,8 @@ _toomany:
 
 		/* Wait for AP to signal it is ready before starting next AP */
 		do { asm volatile ("pause" : : : "memory"); } while (!_ap_startup_flag);
+
+		processor_count++;
 	}
 
 	/* Copy data back */
@@ -442,6 +470,12 @@ _toomany:
 	mmu_frame_clear(tmp_space);
 
 	dprintf("smp: enabled with %d cores\n", cores);
+	return;
+
+_pit_fallback:
+	dprintf("pit: falling back to pit as preempt source\n");
+	extern void pit_initialize(void);
+	pit_initialize();
 }
 
 /**

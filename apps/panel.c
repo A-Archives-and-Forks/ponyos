@@ -50,6 +50,17 @@
 #define ALTF2_WIDTH 400
 #define ALTF2_HEIGHT 200
 
+/* How many windows we can support in the advertisement lift before truncating it */
+#define MAX_WINDOW_COUNT 100
+/* Height of the panel window */
+#define PANEL_HEIGHT 27
+/* How far down dropdown menus should be shown */
+#define DROPDOWN_OFFSET PANEL_HEIGHT
+/* How much padding should be assured on the left and right of the screen for menus */
+#define MENU_PAD 4
+
+static struct PanelContext panel_context;
+
 static gfx_context_t * ctx = NULL;
 static yutani_window_t * panel = NULL;
 
@@ -68,45 +79,17 @@ yutani_t * yctx;
 int width;
 int height;
 
-struct TT_Font * font = NULL;
-struct TT_Font * font_bold = NULL;
-struct TT_Font * font_mono = NULL;
-struct TT_Font * font_mono_bold = NULL;
-
 list_t * widgets_enabled = NULL;
 
 /* Windows, indexed by z-order */
 struct window_ad * ads_by_z[MAX_WINDOW_COUNT+1] = {NULL};
 
-int focused_app = -1;
 int active_window = -1;
 
 static int was_tabbing = 0;
 static int new_focused = -1;
 
 static void widgets_layout(void);
-
-/**
- * Clip text and add ellipsis to fit a specified display width.
- */
-char * ellipsify(char * input, int font_size, struct TT_Font * font, int max_width, int * out_width) {
-	int len = strlen(input);
-	char * out = malloc(len + 4);
-	memcpy(out, input, len + 1);
-	int width;
-	tt_set_size(font, font_size);
-	while ((width = tt_string_width(font, out)) > max_width) {
-		len--;
-		out[len+0] = '.';
-		out[len+1] = '.';
-		out[len+2] = '.';
-		out[len+3] = '\0';
-	}
-
-	if (out_width) *out_width = width;
-
-	return out;
-}
 
 static int _close_enough(struct yutani_msg_window_mouse_event * me) {
 	if (me->command == YUTANI_MOUSE_EVENT_RAISE && sqrt(pow(me->new_x - me->old_x, 2) + pow(me->new_y - me->old_y, 2)) < 10) {
@@ -177,7 +160,7 @@ static void panel_check_click(struct yutani_msg_window_mouse_event * evt) {
 
 		/* Figure out what widget this belongs to */
 		struct PanelWidget * target = NULL;
-		if (evt->new_y >= Y_PAD && evt->new_y < PANEL_HEIGHT - Y_PAD) {
+		if (evt->new_y >= 0 && evt->new_y < PANEL_HEIGHT) {
 			foreach(widget_node, widgets_enabled) {
 				struct PanelWidget * widget = widget_node->value;
 				if (evt->new_x >= widget->left && evt->new_x < widget->left + widget->width) {
@@ -226,9 +209,9 @@ static void redraw_altf2(void) {
 	draw_rounded_rectangle(a2ctx,0,0, ALTF2_WIDTH, ALTF2_HEIGHT, 11, premultiply(rgba(120,120,120,150)));
 	draw_rounded_rectangle(a2ctx,1,1, ALTF2_WIDTH-2, ALTF2_HEIGHT-2, 10, ALTTAB_BACKGROUND);
 
-	tt_set_size(font, 20);
-	int t = tt_string_width(font, altf2_buffer);
-	tt_draw_string(a2ctx, font, center_x_a2(t), 80, altf2_buffer, rgb(255,255,255));
+	tt_set_size(panel_context.font, 20);
+	int t = tt_string_width(panel_context.font, altf2_buffer);
+	tt_draw_string(a2ctx, panel_context.font, center_x_a2(t), 80, altf2_buffer, rgb(255,255,255));
 
 	flip(a2ctx);
 	yutani_flip(yctx, alt_f2);
@@ -297,10 +280,10 @@ static void redraw_alttab(void) {
 		/* try very hard to get a window texture */
 		char key[1024];
 		YUTANI_SHMKEY_EXP(yctx->server_ident, key, 1024, ad->bufid);
-		size_t size;
+		size_t size = 0;
 		uint32_t * buf =  shm_obtain(key, &size);
 
-		if (buf) {
+		if (buf && size >= ad->width * ad->height * 4) {
 			sprite_t tmp;
 			tmp.width = ad->width;
 			tmp.height = ad->height;
@@ -337,9 +320,9 @@ static void redraw_alttab(void) {
 	{
 		struct window_ad * ad = ads_by_z[new_focused];
 		int t;
-		char * title = ellipsify(ad->name, 16, font, alttab->width - 20, &t);
-		tt_set_size(font, 16);
-		tt_draw_string(actx, font, center_x_a(t), rows * (ALTTAB_WIN_SIZE + 20) + 44, title, rgb(255,255,255));
+		char * title = tt_ellipsify(ad->name, 16, panel_context.font, alttab->width - 20, &t);
+		tt_set_size(panel_context.font, 16);
+		tt_draw_string(actx, panel_context.font, center_x_a(t), rows * (ALTTAB_WIN_SIZE + 20) + 44, title, rgb(255,255,255));
 		free(title);
 	}
 
@@ -441,7 +424,8 @@ static void handle_key_event(struct yutani_msg_key_event * ke) {
 		(ke->event.action == KEY_ACTION_DOWN)) {
 		/* show menu */
 		if (!alt_f2) {
-			alt_f2 = yutani_window_create(yctx, ALTF2_WIDTH, ALTF2_HEIGHT);
+			alt_f2 = yutani_window_create_flags(yctx, ALTF2_WIDTH, ALTF2_HEIGHT, YUTANI_WINDOW_FLAG_BLUR_BEHIND);
+			yutani_window_update_shape(yctx, alt_f2, 5);
 			yutani_window_move(yctx, alt_f2, center_x(ALTF2_WIDTH), center_y(ALTF2_HEIGHT));
 			a2ctx = init_graphics_yutani_double_buffer(alt_f2);
 			redraw_altf2();
@@ -495,7 +479,8 @@ static void handle_key_event(struct yutani_msg_key_event * ke) {
 			new_focused = active_window + direction;
 			/* Create tab window */
 			alttab = yutani_window_create_flags(yctx, ALTTAB_WIDTH, ALTTAB_HEIGHT,
-				YUTANI_WINDOW_FLAG_NO_STEAL_FOCUS | YUTANI_WINDOW_FLAG_NO_ANIMATION);
+				YUTANI_WINDOW_FLAG_NO_STEAL_FOCUS | YUTANI_WINDOW_FLAG_NO_ANIMATION | YUTANI_WINDOW_FLAG_BLUR_BEHIND);
+			yutani_window_update_shape(yctx, alttab, 5);
 
 			yutani_set_stack(yctx, alttab, YUTANI_ZORDER_OVERLAY);
 
@@ -530,7 +515,7 @@ void redraw(void) {
 
 	foreach(widget_node, widgets_enabled) {
 		struct PanelWidget * widget = widget_node->value;
-		gfx_context_t * inner = init_graphics_subregion(ctx, widget->left, Y_PAD, widget->width, PANEL_HEIGHT - Y_PAD * 2);
+		gfx_context_t * inner = init_graphics_subregion(ctx, widget->left, 0, widget->width, PANEL_HEIGHT);
 		widget->draw(widget, inner);
 		free(inner);
 	}
@@ -614,8 +599,7 @@ static void update_window_list(void) {
 }
 
 static void redraw_panel_background(gfx_context_t * ctx, int width, int height) {
-	draw_fill(ctx, rgba(0,0,0,0));
-	draw_rounded_rectangle(ctx, X_PAD, Y_PAD, width - X_PAD * 2, panel->height - Y_PAD * 2, 14, rgba(0,0,0,200));
+	draw_fill(ctx, rgba(0,0,0,0xF2));
 }
 
 static void resize_finish(int xwidth, int xheight) {
@@ -678,6 +662,12 @@ static int widget_leave_generic(struct PanelWidget * this, struct yutani_msg_win
 	return 1;
 }
 
+void panel_highlight_widget(struct PanelWidget * this, gfx_context_t * ctx, int active) {
+	if (this->highlighted || active) {
+		draw_rounded_rectangle(ctx, 3, 3, ctx->width - 6, ctx->height - 6, 11, premultiply(rgba(120,120,120,active ? 180 : 150)));
+	}
+}
+
 static int widget_draw_generic(struct PanelWidget * this, gfx_context_t * ctx) {
 	draw_rounded_rectangle(
 		ctx, 0, 0, ctx->width, ctx->height, 7, premultiply(rgba(120,120,120,150)));
@@ -691,7 +681,7 @@ static int widget_draw_generic(struct PanelWidget * this, gfx_context_t * ctx) {
 	return 0;
 }
 
-static int widget_update_generic(struct PanelWidget * this) {
+static int widget_update_generic(struct PanelWidget * this, int * force_updates) {
 	return 0;
 }
 
@@ -701,6 +691,7 @@ static int widget_onkey_generic(struct PanelWidget * this, struct yutani_msg_key
 
 struct PanelWidget * widget_new(void) {
 	struct PanelWidget * out = calloc(1, sizeof(struct PanelWidget));
+	out->pctx = &panel_context;
 	out->draw = widget_draw_generic;
 	out->click = mouse_event_ignore; /* click_generic */
 	out->right_click = mouse_event_ignore; /* right_click_generic */
@@ -727,8 +718,8 @@ static void widgets_layout(void) {
 	}
 
 	/* Now lay out the widgets */
-	int x = 16;
-	int available = width - 32;
+	int x = 0;
+	int available = width;
 	foreach(node, widgets_enabled) {
 		struct PanelWidget * widget = node->value;
 		widget->left = x;
@@ -739,11 +730,12 @@ static void widgets_layout(void) {
 	}
 }
 
-static void update_periodic_widgets(void) {
+static void update_periodic_widgets(int * force_updates) {
+	*force_updates = 0;
 	int needs_layout = 0;
 	foreach(widget_node, widgets_enabled) {
 		struct PanelWidget * widget = widget_node->value;
-		needs_layout |= widget->update(widget);
+		needs_layout |= widget->update(widget, force_updates);
 	}
 	if (needs_layout) widgets_layout();
 	redraw();
@@ -755,11 +747,11 @@ int panel_menu_show_at(struct MenuList * menu, int x) {
 	/* Calculate the expected size of the menu window. */
 	menu_calculate_dimensions(menu, &mheight, &mwidth);
 
-	if (x - mwidth / 2 < X_PAD) {
-		offset = X_PAD;
+	if (x - mwidth / 2 < MENU_PAD) {
+		offset = MENU_PAD;
 		menu->flags = (menu->flags & ~MENU_FLAG_BUBBLE) | MENU_FLAG_BUBBLE_LEFT;
-	} else if (x + mwidth / 2 > width - X_PAD) {
-		offset = width - X_PAD - mwidth;
+	} else if (x + mwidth / 2 > width - MENU_PAD) {
+		offset = width - MENU_PAD - mwidth;
 		menu->flags = (menu->flags & ~MENU_FLAG_BUBBLE) | MENU_FLAG_BUBBLE_RIGHT;
 	} else {
 		offset = x - mwidth / 2;
@@ -770,15 +762,10 @@ int panel_menu_show_at(struct MenuList * menu, int x) {
 	menu->tail_offset = x - offset;
 
 	/* Prepare the menu, which creates the window. */
-	menu_prepare(menu, yctx);
+	menu_show_at(menu, panel, offset, DROPDOWN_OFFSET);
 
 	/* If we succeeded, move it to the final offset and display it */
-	if (menu->window) {
-		yutani_window_move(yctx, menu->window, offset, DROPDOWN_OFFSET);
-		yutani_flip(yctx,menu->window);
-		return 0;
-	}
-
+	if (menu->window) return 0;
 	return 1;
 }
 
@@ -802,17 +789,26 @@ int main (int argc, char ** argv) {
 	yctx = yutani_init();
 
 	/* Shared fonts */
-	font           = tt_font_from_shm("sans-serif");
-	font_bold      = tt_font_from_shm("sans-serif.bold");
-	font_mono      = tt_font_from_shm("monospace");
-	font_mono_bold = tt_font_from_shm("monospace.bold");
+	panel_context.font           = tt_font_from_shm("sans-serif");
+	panel_context.font_bold      = tt_font_from_shm("sans-serif.bold");
+	panel_context.font_mono      = tt_font_from_shm("monospace");
+	panel_context.font_mono_bold = tt_font_from_shm("monospace.bold");
 
 	/* For convenience, store the display size */
 	width  = yctx->display_width;
 	height = yctx->display_height;
 
+	panel_context.color_text_normal    = rgb(230,230,230);
+	panel_context.color_text_hilighted = rgb(251,123,250);
+	panel_context.color_text_focused   = rgb(255,255,255);
+	panel_context.color_icon_normal    = rgb(230,230,230);
+	panel_context.color_special        = rgb(255,72,254);
+	panel_context.font_size_default    = 14;
+	panel_context.extra_widget_spacing = 12;
+
 	/* Create the panel window */
 	panel = yutani_window_create_flags(yctx, width, PANEL_HEIGHT, YUTANI_WINDOW_FLAG_NO_STEAL_FOCUS | YUTANI_WINDOW_FLAG_ALT_ANIMATION);
+	panel_context.basewindow = panel;
 
 	/* And move it to the top layer */
 	yutani_set_stack(yctx, panel, YUTANI_ZORDER_TOP);
@@ -869,7 +865,8 @@ int main (int argc, char ** argv) {
 	}
 
 	/* Lay out the widgets */
-	update_periodic_widgets();
+	int force_updates = 0;
+	update_periodic_widgets(&force_updates);
 	widgets_layout();
 
 	/* Subscribe to window updates */
@@ -889,7 +886,7 @@ int main (int argc, char ** argv) {
 
 	while (_continue) {
 
-		int index = fswait2(1,fds,200);
+		int index = fswait2(1,fds,force_updates ? 50 : 200); /* ~20 fps? */
 
 		if (index == 0) {
 			/* Respond to Yutani events */
@@ -939,13 +936,13 @@ int main (int argc, char ** argv) {
 
 		struct timeval now;
 		gettimeofday(&now, NULL);
-		if (now.tv_sec != last_tick) {
+		if (now.tv_sec != last_tick || force_updates) {
 			last_tick = now.tv_sec;
 			waitpid(-1, NULL, WNOHANG);
-			update_periodic_widgets();
 			if (was_tabbing) {
 				redraw_alttab();
 			}
+			update_periodic_widgets(&force_updates);
 		}
 	}
 

@@ -2,6 +2,7 @@
  * @file modules/ext2.c
  * @brief Implementation of the Ext2 filesystem.
  * @package x86_64
+ * @package aarch64
  *
  * @warning There are many known bugs in this implementation.
  *
@@ -843,6 +844,10 @@ static int mkdir_ext2(fs_node_t * parent, char * name, mode_t permission) {
 		return -EEXIST;
 	}
 
+	if (!has_permission(parent, 02) || !has_permission(parent, 01)) {
+		return -EACCES;
+	}
+
 	/* Allocate an inode for it */
 	unsigned int inode_no = allocate_inode(this);
 	ext2_inodetable_t * inode = read_inode(this,inode_no);
@@ -1306,9 +1311,10 @@ static ssize_t write_ext2(fs_node_t *node, off_t offset, size_t size, uint8_t *b
 	return rv;
 }
 
-static int truncate_ext2(fs_node_t * node) {
+static int truncate_ext2(fs_node_t * node, size_t size) {
 	ext2_fs_t * this = node->device;
 	if (!(this->flags & EXT2_FLAG_READWRITE)) return -EROFS;
+	if (size != 0) return -ENOTSUP;
 
 	ext2_inodetable_t * inode = read_inode(this,node->inode);
 	inode->size = 0;

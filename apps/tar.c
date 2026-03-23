@@ -11,6 +11,7 @@
  * of the NCSA / University of Illinois License - see LICENSE.md
  * Copyright (C) 2018-2020 K. Lange
  */
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -55,13 +56,10 @@ static struct ustar * extract_file(FILE * f) {
 		return NULL;
 	}
 
-	if (_ustar.ustar[0] != 'u' ||
-		_ustar.ustar[1] != 's' ||
-		_ustar.ustar[2] != 't' ||
-		_ustar.ustar[3] != 'a' ||
-		_ustar.ustar[4] != 'r') {
+	if (_ustar.filename[0] == 0) {
 		return NULL;
 	}
+
 	return &_ustar;
 }
 
@@ -189,6 +187,58 @@ int main(int argc, char * argv[]) {
 #define TAR_ACTION_CREATE  2
 #define TAR_ACTION_LIST    3
 
+	if (argc > 1 && argv[1][0] != '-') {
+		switch(argv[1][0]) {
+			case 'x':
+				action = TAR_ACTION_EXTRACT;
+				break;
+			case 'c':
+				action = TAR_ACTION_CREATE;
+				break;
+			case 't':
+				action = TAR_ACTION_LIST;
+				break;
+			default:
+				usage(argv);
+				return 1;
+		}
+
+		/* Go through the rest of the argument */
+		int expect_file = 0;
+		for (int i = 1; argv[1][i]; ++i) {
+			switch (argv[1][i]) {
+				case 'f':
+					expect_file = 1;
+					break;
+				case 'v':
+					verbose = 1;
+					break;
+				case 'z':
+					compressed = 1;
+					break;
+				case 'O':
+					to_stdout = 1;
+					break;
+				default:
+					fprintf(stderr, "%s: %c: unrecognized option\n", argv[0], argv[1][i]);
+					return 1;
+			}
+		}
+
+		optind = 2;
+
+		if (expect_file) {
+			if (argc < 3) {
+				fprintf(stderr, "%s: filename expected after arguments\n", argv[0]);
+				return 1;
+			}
+			optind = 3;
+			fname = argv[2];
+		}
+
+		goto _skip_getopt;
+	}
+
 	while ((opt = getopt(argc, argv, "?ctxzvaf:O")) != -1) {
 		switch (opt) {
 			case 'c':
@@ -232,6 +282,9 @@ int main(int argc, char * argv[]) {
 				return 1;
 		}
 	}
+
+_skip_getopt:
+	(void)0;
 
 	if (!fname) {
 		fname = "-";

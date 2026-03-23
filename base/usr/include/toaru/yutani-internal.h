@@ -19,6 +19,7 @@ _Begin_C_Header
 #define yutani_msg_buildx_mouse_event_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_mouse_event)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
 #define yutani_msg_buildx_window_move_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_move)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
 #define yutani_msg_buildx_window_move_relative_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_move_relative)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
+#define yutani_msg_buildx_window_set_parent_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_set_parent)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
 #define yutani_msg_buildx_window_stack_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_stack)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
 #define yutani_msg_buildx_window_focus_change_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_focus_change)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
 #define yutani_msg_buildx_window_mouse_event_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_mouse_event)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
@@ -39,18 +40,20 @@ _Begin_C_Header
 #define yutani_msg_buildx_window_resize_start_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_resize_start)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
 #define yutani_msg_buildx_special_request_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_special_request)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
 #define yutani_msg_buildx_clipboard_alloc(out, length) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_clipboard)+length]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
+#define yutani_msg_buildx_window_panel_size_alloc(out) char _yutani_tmp_ ## LINE [sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_panel_size)]; yutani_msg_t * out = (void *)&_yutani_tmp_ ## LINE;
 
 extern void yutani_msg_buildx_hello(yutani_msg_t * msg);
 extern void yutani_msg_buildx_flip(yutani_msg_t * msg, yutani_wid_t wid);
 extern void yutani_msg_buildx_welcome(yutani_msg_t * msg, uint32_t width, uint32_t height);
 extern void yutani_msg_buildx_window_new(yutani_msg_t * msg, uint32_t width, uint32_t height);
-extern void yutani_msg_buildx_window_new_flags(yutani_msg_t * msg, uint32_t width, uint32_t height, uint32_t flags);
+extern void yutani_msg_buildx_window_new_flags(yutani_msg_t * msg, uint32_t width, uint32_t height, uint32_t flags, yutani_wid_t parent_wid);
 extern void yutani_msg_buildx_window_init(yutani_msg_t * msg, yutani_wid_t wid, uint32_t width, uint32_t height, uint32_t bufid);
 extern void yutani_msg_buildx_window_close(yutani_msg_t * msg, yutani_wid_t wid);
 extern void yutani_msg_buildx_key_event(yutani_msg_t * msg, yutani_wid_t wid, key_event_t * event, key_event_state_t * state);
 extern void yutani_msg_buildx_mouse_event(yutani_msg_t * msg, yutani_wid_t wid, mouse_device_packet_t * event, int32_t type);
 extern void yutani_msg_buildx_window_move(yutani_msg_t * msg, yutani_wid_t wid, int32_t x, int32_t y);
 extern void yutani_msg_buildx_window_move_relative(yutani_msg_t * msg, yutani_wid_t wid, yutani_wid_t wid2, int32_t x, int32_t y);
+extern void yutani_msg_buildx_window_set_parent(yutani_msg_t * msg, yutani_wid_t wid, yutani_wid_t wid2);
 extern void yutani_msg_buildx_window_stack(yutani_msg_t * msg, yutani_wid_t wid, int z);
 extern void yutani_msg_buildx_window_focus_change(yutani_msg_t * msg, yutani_wid_t wid, int focused);
 extern void yutani_msg_buildx_window_mouse_event(yutani_msg_t * msg, yutani_wid_t wid, int32_t new_x, int32_t new_y, int32_t old_x, int32_t old_y, uint8_t buttons, uint8_t command, uint8_t modifiers);
@@ -71,5 +74,6 @@ extern void yutani_msg_buildx_window_show_mouse(yutani_msg_t * msg, yutani_wid_t
 extern void yutani_msg_buildx_window_resize_start(yutani_msg_t * msg, yutani_wid_t wid, yutani_scale_direction_t direction);
 extern void yutani_msg_buildx_special_request(yutani_msg_t * msg, yutani_wid_t wid, uint32_t request);
 extern void yutani_msg_buildx_clipboard(yutani_msg_t * msg, char * content);
+extern void yutani_msg_buildx_window_panel_size(yutani_msg_t * msg, yutani_wid_t wid, int32_t x, int32_t y, int32_t w, int32_t h);
 
 _End_C_Header

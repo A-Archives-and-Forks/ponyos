@@ -18,7 +18,7 @@ STRIP= ${TARGET}-strip
 
 # CFLAGS for kernel objects and modules
 KERNEL_CFLAGS  = -ffreestanding -O2 -std=gnu11 -g -static --sysroot=base
-KERNEL_CFLAGS += -Wall -Wextra -Wno-unused-function -Wno-unused-parameter
+KERNEL_CFLAGS += -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wstrict-prototypes
 KERNEL_CFLAGS += -pedantic -Wwrite-strings ${ARCH_KERNEL_CFLAGS}
 
 # Defined constants for the kernel
@@ -58,11 +58,17 @@ LIBS_X=$(foreach lib,$(LIBS),$(BASE)/lib/libtoaru_$(lib).so)
 LIBS_Y=$(foreach lib,$(LIBS),.make/$(lib).lmak)
 
 KRK_MODS = $(patsubst kuroko/src/modules/module_%.c,$(BASE)/lib/kuroko/%.so,$(wildcard kuroko/src/modules/module_*.c))
-KRK_MODS += $(patsubst kuroko/modules/%,$(BASE)/lib/kuroko/%,$(wildcard kuroko/modules/*.krk kuroko/modules/*/*/.krk kuroko/modules/*/*/*.krk))
+KRK_MODS += $(patsubst kuroko/modules/%,$(BASE)/lib/kuroko/%,$(wildcard kuroko/modules/*.krk kuroko/modules/*/*.krk kuroko/modules/*/*/.krk kuroko/modules/*/*/*.krk))
+KRK_MODS += $(patsubst lib/kuroko/%,$(BASE)/lib/kuroko/%,$(wildcard lib/kuroko/*.krk))
 KRK_MODS_X = $(patsubst lib/kuroko/%.c,$(BASE)/lib/kuroko/%.so,$(wildcard lib/kuroko/*.c))
 KRK_MODS_Y = $(patsubst lib/kuroko/%.c,.make/%.kmak,$(wildcard lib/kuroko/*.c))
 
+BIM_FILES  = $(patsubst bim/syntax/%,$(BASE)/usr/share/bim/syntax/%,$(wildcard bim/syntax/*.krk))
+BIM_FILES += $(patsubst bim/themes/%,$(BASE)/usr/share/bim/themes/%,$(wildcard bim/themes/*.krk))
+BIM_FILES += $(patsubst bim/site/%,$(BASE)/usr/share/bim/site/%,$(wildcard bim/site/*.krk))
+
 CFLAGS= -O2 -std=gnu11 -I. -Iapps -fplan9-extensions -Wall -Wextra -Wno-unused-parameter ${ARCH_USER_CFLAGS}
+LIBC_CFLAGS = -O2 -std=gnu11 -ffreestanding -Wall -Wextra -Wno-unused-parameter ${ARCH_USER_CFLAGS}
 
 LIBC_OBJS  = $(patsubst %.c,%.o,$(wildcard libc/*.c))
 LIBC_OBJS += $(patsubst %.c,%.o,$(wildcard libc/*/*.c))
@@ -77,10 +83,23 @@ LC = $(BASE)/lib/libc.so $(GCC_SHARED)
 .PHONY: all system clean run shell
 
 $(BASE)/mod/%.ko: modules/%.c | dirs
-	${CC} -c ${KERNEL_CFLAGS} -mcmodel=large  -o $@ $<
+	${CC} -c ${KERNEL_CFLAGS} -fno-pie -mcmodel=large  -o $@ $<
 
-ramdisk.igz: $(wildcard $(BASE)/* $(BASE)/*/* $(BASE)/*/*/* $(BASE)/*/*/*/* $(BASE)/*/*/*/*/*) $(APPS_X) $(LIBS_X) $(KRK_MODS_X) $(BASE)/bin/kuroko $(BASE)/lib/ld.so $(BASE)/lib/libm.so $(APPS_KRK_X) $(KRK_MODS) $(APPS_SH_X) $(MODULES)
+ramdisk.igz: $(wildcard $(BASE)/* $(BASE)/*/* $(BASE)/*/*/* $(BASE)/*/*/*/* $(BASE)/*/*/*/*/*) $(APPS_X) $(LIBS_X) $(KRK_MODS_X) $(BASE)/bin/kuroko $(BASE)/bin/bim $(BIM_FILES) $(BASE)/lib/ld.so $(BASE)/lib/libm.so $(APPS_KRK_X) $(KRK_MODS) $(APPS_SH_X) $(MODULES) $(BASE)/etc/issue $(BASE)/etc/os-release
 	python3 util/createramdisk.py
+
+$(BASE)/etc/issue: kernel/sys/version.c util/generate-etc-issue.sh
+	sh util/generate-etc-issue.sh > $@
+
+$(BASE)/etc/os-release: kernel/sys/version.c util/generate-etc-os-release.sh
+	sh util/generate-etc-os-release.sh > $@
+
+$(BASE)/usr/share/bim/%.krk: bim/%.krk
+	mkdir -p $(dir $@)
+	cp $< $@
+
+$(BASE)/bin/bim: bim/bim.c bim/bim.h | $(LC) $(BASE)/lib/libkuroko.so
+	$(CC) $(CFLAGS) $(shell cd bim; docs/git-tag) -o $@ -Ibim -Ikuroko/src $< -lkuroko
 
 KRK_SRC = $(sort $(wildcard kuroko/src/*.c))
 $(BASE)/bin/kuroko: $(KRK_SRC) $(CRTS)  lib/rline.c | $(LC)
@@ -90,6 +109,10 @@ $(BASE)/lib/kuroko/%.so: kuroko/src/modules/module_%.c| dirs $(LC)
 	$(CC) $(CFLAGS) -shared -fPIC -Ikuroko/src -o $@ $<
 
 $(BASE)/lib/kuroko/%.krk: kuroko/modules/%.krk | dirs
+	mkdir -p $(dir $@)
+	cp $< $@
+
+$(BASE)/lib/kuroko/%.krk: lib/kuroko/%.krk | dirs
 	mkdir -p $(dir $@)
 	cp $< $@
 
@@ -103,8 +126,7 @@ kernel/sys/version.o: ${KERNEL_SOURCES}
 
 kernel/symbols.o: ${KERNEL_ASMOBJS} ${KERNEL_OBJS} util/gensym.krk
 	-rm -f kernel/symbols.o
-	${CC} -T kernel/arch/${ARCH}/link.ld ${KERNEL_CFLAGS} -o misaka-kernel.64 ${KERNEL_ASMOBJS} ${KERNEL_OBJS}
-	${NM} misaka-kernel.64 -g | kuroko util/gensym.krk > kernel/symbols.S
+	${NM} -g -f p ${KERNEL_ASMOBJS} ${KERNEL_OBJS} | kuroko util/gensym.krk > kernel/symbols.S
 	${CC} -c kernel/symbols.S -o $@
 
 kernel/%.o: kernel/%.S
@@ -122,6 +144,7 @@ clean:
 	-rm -f ramdisk.tar ramdisk.igz 
 	-rm -f $(APPS_Y) $(LIBS_Y) $(KRK_MODS_Y) $(KRK_MODS)
 	-rm -f $(APPS_X) $(LIBS_X) $(KRK_MODS_X) $(APPS_KRK_X) $(APPS_SH_X)
+	-rm -f $(BIM_FILES) $(BASE)/bin/bim
 	-rm -f $(BASE)/lib/crt0.o $(BASE)/lib/crti.o $(BASE)/lib/crtn.o
 	-rm -f $(BASE)/lib/libc.so $(BASE)/lib/libc.a
 	-rm -f $(LIBC_OBJS) $(BASE)/lib/ld.so $(BASE)/lib/libkuroko.so $(BASE)/lib/libm.so
@@ -130,7 +153,7 @@ clean:
 	-rm -f boot/efi/*.o boot/bios/*.o
 
 libc/%.o: libc/%.c base/usr/include/syscall.h 
-	$(CC) -O2 -std=gnu11 -ffreestanding -Wall -Wextra -Wno-unused-parameter -fPIC -c -o $@ $<
+	$(CC) ${LIBC_CFLAGS} -fPIC -c -o $@ $<
 
 .PHONY: libc
 libc: $(BASE)/lib/libc.a $(BASE)/lib/libc.so
@@ -185,7 +208,7 @@ cdrom:
 	mkdir -p .make
 dirs: $(BASE)/dev $(BASE)/tmp $(BASE)/proc $(BASE)/bin $(BASE)/lib $(BASE)/cdrom $(BASE)/usr/lib $(BASE)/usr/bin $(BASE)/lib/kuroko cdrom $(BASE)/var fatbase/efi/boot .make $(BASE)/mod boot/efi boot/bios
 
-ifeq (,$(findstring clean,$(MAKECMDGOALS)))
+ifeq (,$(findstring clean,$(MAKECMDGOALS))$(findstring $(BUILD_KRK),$(MAKECMDGOALS)))
 -include ${APPS_Y}
 -include ${LIBS_Y}
 -include ${KRK_MODS_Y}

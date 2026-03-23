@@ -44,6 +44,7 @@ uint32_t lfb_resolution_s = 0;
 uint8_t * lfb_vid_memory = (uint8_t *)0xE0000000;
 size_t lfb_memsize = 0xFF0000;
 const char * lfb_driver_name = NULL;
+int lfb_use_write_combining = 0;
 
 uintptr_t lfb_qemu_mmio = 0;
 
@@ -110,7 +111,7 @@ static int ioctl_vid(fs_node_t * node, unsigned long request, void * argp) {
 				}
 				for (uintptr_t i = 0; i < lfb_memsize; i += 0x1000) {
 					union PML * page = mmu_get_page(lfb_user_offset + i, MMU_GET_MAKE);
-					mmu_frame_map_address(page,MMU_FLAG_WRITABLE|MMU_FLAG_WC,((uintptr_t)(lfb_vid_memory) & 0xFFFFFFFF) + i);
+					mmu_frame_map_address(page,MMU_FLAG_WRITABLE | (lfb_use_write_combining ? MMU_FLAG_WC : 0),((uintptr_t)(lfb_vid_memory) & 0xFFFFFFFF) + i);
 				}
 				*((uintptr_t *)argp) = lfb_user_offset;
 			}
@@ -152,11 +153,9 @@ static fs_node_t * lfb_video_device_create(void /* TODO */) {
 	return fnode;
 }
 
-static ssize_t framebuffer_func(fs_node_t * node, off_t offset, size_t size, uint8_t * buffer) {
-	char * buf = malloc(4096);
-
+static void framebuffer_func(fs_node_t * node) {
 	if (lfb_driver_name) {
-		snprintf(buf, 4095,
+		procfs_printf(node,
 			"Driver:\t%s\n"
 			"XRes:\t%d\n"
 			"YRes:\t%d\n"
@@ -170,19 +169,8 @@ static ssize_t framebuffer_func(fs_node_t * node, off_t offset, size_t size, uin
 			lfb_resolution_s,
 			lfb_vid_memory);
 	} else {
-		snprintf(buf, 20, "Driver:\tnone\n");
+		procfs_printf(node, "Driver:\tnone\n");
 	}
-
-	size_t _bsize = strlen(buf);
-	if ((size_t)offset > _bsize) {
-		free(buf);
-		return 0;
-	}
-	if (size > _bsize - (size_t)offset) size = _bsize - offset;
-
-	memcpy(buffer, buf + offset, size);
-	free(buf);
-	return size;
 }
 
 static struct procfs_entry framebuffer_entry = {
@@ -196,7 +184,11 @@ static void finalize_graphics(const char * driver) {
 	lfb_driver_name = driver;
 	lfb_device = lfb_video_device_create();
 	lfb_device->length  = lfb_resolution_s * lfb_resolution_y; /* Size is framebuffer size in bytes */
-	vfs_mount("/dev/fb0", lfb_device);
+
+	char info[100];
+	snprintf(info, 99, "%s,%ux%u", driver, lfb_resolution_x, lfb_resolution_y);
+
+	vfs_mount("/dev/fb0", lfb_device, "lfb", info);
 
 	procfs_install(&framebuffer_entry);
 }
@@ -361,7 +353,7 @@ static void graphics_install_bochs(uint16_t resolution_x, uint16_t resolution_y)
 	finalize_graphics("bochs");
 }
 
-extern void arch_framebuffer_initialize();
+extern void arch_framebuffer_initialize(void);
 
 static void graphics_install_preset(uint16_t w, uint16_t h) {
 	/* Make sure memsize is actually big enough */
@@ -514,7 +506,7 @@ static void vga_text_init(void) {
 	vga_text_device->flags  = FS_BLOCKDEVICE;
 	vga_text_device->mask   = 0660;
 	vga_text_device->ioctl  = ioctl_vga;
-	vfs_mount("/dev/vga0", vga_text_device);
+	vfs_mount("/dev/vga0", vga_text_device, "vgatext", "");
 }
 
 static int lfb_init(const char * c) {
@@ -543,6 +535,10 @@ static int lfb_init(const char * c) {
 	} else if (!lfb_resolution_x) {
 		x = PREFERRED_W;
 		y = PREFERRED_H;
+	}
+
+	if (args_present("lfbwc")) {
+		lfb_use_write_combining = 1;
 	}
 
 	int ret_val = 0;

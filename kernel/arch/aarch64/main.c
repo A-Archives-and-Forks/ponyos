@@ -37,6 +37,7 @@ extern void fbterm_initialize(void);
 extern void mmu_init(size_t memsize, size_t phys, uintptr_t firstFreePage, uintptr_t endOfInitrd);
 extern void aarch64_regs(struct regs *r);
 extern void fwcfg_load_initrd(uintptr_t * ramdisk_phys_base, size_t * ramdisk_size);
+extern void fwcfg_device(void);
 extern void virtio_input(void);
 extern void aarch64_smp_start(void);
 
@@ -81,10 +82,7 @@ size_t arch_cpu_mhz(void) {
  * megahertz at worst which is good enough for us. We do want slightly bigger
  * numbers to make our integer divisions more accurate...
  */
-static void arch_clock_initialize() {
-
-	/* QEMU RTC */
-	//void * clock_addr = mmu_map_from_physical(0x09010000);
+static void arch_clock_initialize(uintptr_t rpi_tag) {
 
 	/* Get frequency of system timer */
 	uint64_t val;
@@ -92,8 +90,13 @@ static void arch_clock_initialize() {
 	sys_timer_freq = val / 10000;
 
 	/* Get boot time from RTC */
-	//arch_boot_time = *(volatile uint32_t*)clock_addr;
-	arch_boot_time = 1644908027UL;
+	if (rpi_tag) {
+		arch_boot_time = 1644908027UL;
+	} else {
+		/* QEMU RTC */
+		void * clock_addr = mmu_map_from_physical(0x09010000);
+		arch_boot_time = *(volatile uint32_t*)clock_addr;
+	}
 
 	/* Get the "basis time" - the perf timestamp we got the wallclock time at */
 	basis_time = arch_perf_timer() / sys_timer_freq;
@@ -276,6 +279,7 @@ void aarch64_sync_enter(struct regs * r) {
 		dprintf("Unknown exception: ESR: %#zx FAR: %#zx ELR: %#zx SPSR: %#zx\n", esr, far, elr, spsr);
 		dprintf("Instruction at ELR: 0x%08x\n", *(uint32_t*)elr);
 		arch_dump_traceback();
+		aarch64_regs(r);
 		arch_fatal();
 	}
 
@@ -298,7 +302,7 @@ void aarch64_sync_enter(struct regs * r) {
 	}
 
 	/* Magic signal return */
-	if (elr == 0x8DEADBEEF && far == 0x8DEADBEEF) {
+	if (elr == 0x516 && far == 0x516) {
 		return_from_signal_handler(r);
 		goto _resume_user;
 	}
@@ -330,6 +334,7 @@ void aarch64_sync_enter(struct regs * r) {
 
 _resume_user:
 	process_check_signals(r);
+	update_process_times_on_exit();
 }
 
 static void spin(void) {
@@ -337,8 +342,6 @@ static void spin(void) {
 		asm volatile ("wfi");
 	}
 }
-
-char _ret_from_preempt_source[1];
 
 #define EOI(x) do { \
 	gicc_regs[4] = (x); \
@@ -454,6 +457,12 @@ void fpu_enable(void) {
 	asm volatile ("mrs %0, CPACR_EL1" : "=r"(cpacr_el1));
 	cpacr_el1 |= (3 << 20) | (3 << 16);
 	asm volatile ("msr CPACR_EL1, %0" :: "r"(cpacr_el1));
+
+	/* Enable access to physical timer */
+	uint64_t clken = 0;
+	asm volatile ("mrs %0,CNTKCTL_EL1" : "=r"(clken));
+	clken |= (1 << 0);
+	asm volatile ("msr CNTKCTL_EL1,%0" :: "r"(clken));
 }
 
 /**
@@ -541,8 +550,10 @@ int kmain(uintptr_t dtb_base, uintptr_t phys_base, uintptr_t rpi_tag) {
 
 		fbterm_initialize();
 	} else {
-		early_log_initialize();
-		console_set_output(_early_log_write);
+		/* Uncomment to get serial log on startup; otherwise, you can set
+		 * 'qemu-serial-log' in the command line to get it later, which will
+		 * still dump the early log messages. */
+		//early_log_initialize();
 	}
 
 	dprintf("%s %d.%d.%d-%s %s %s\n",
@@ -561,7 +572,7 @@ int kmain(uintptr_t dtb_base, uintptr_t phys_base, uintptr_t rpi_tag) {
 	arch_set_core_base((uintptr_t)&processor_local_data[0]);
 
 	/* Set up the system timer and get an RTC time. */
-	arch_clock_initialize();
+	arch_clock_initialize(rpi_tag);
 
 	/* Set up exception handlers early... */
 	exception_handlers();
@@ -603,6 +614,13 @@ int kmain(uintptr_t dtb_base, uintptr_t phys_base, uintptr_t rpi_tag) {
 
 		/* Find the cmdline */
 		dtb_locate_cmdline(&_arch_args);
+
+		if (args_present("qemu-serial-log")) {
+			early_log_initialize();
+		}
+
+		/* Check for PCIe address? */
+		dtb_pcie_base();
 	}
 
 	gic_map_regs(rpi_tag);
@@ -624,6 +642,7 @@ int kmain(uintptr_t dtb_base, uintptr_t phys_base, uintptr_t rpi_tag) {
 	/* Ramdisk */
 	ramdisk_mount(ramdisk_phys_base, ramdisk_size);
 
+	extern void dtb_device(void);
 	dtb_device();
 
 	/* Load MIDR */
@@ -639,15 +658,12 @@ int kmain(uintptr_t dtb_base, uintptr_t phys_base, uintptr_t rpi_tag) {
 		/* Install drivers that may need to sleep here */
 		virtio_input();
 
+		/* QEMU fwcfg interface */
+		fwcfg_device();
+
 		/* Set up serial input */
 		extern void pl011_start(void);
 		pl011_start();
-
-		extern int ac97_install(int argc, char * argv[]);
-		ac97_install(0,NULL);
-
-		extern int e1000_install(int argc, char * argv[]);
-		e1000_install(0,NULL);
 	} else {
 
 		extern void rpi_smp_init(void);

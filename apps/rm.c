@@ -18,7 +18,11 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 
+#ifndef IS_MV
+#define APP_NAME "rm"
 static int recursive = 0;
+#endif
+
 static int rm_thing(char * tmp);
 
 static int rm_directory(char * source) {
@@ -38,11 +42,17 @@ static int rm_directory(char * source) {
 		sprintf(tmp, "%s/%s", source, ent->d_name);
 		int status = rm_thing(tmp);
 		if (status) return status;
+		rewinddir(dirp);
 		ent = readdir(dirp);
 	}
 	closedir(dirp);
 
-	return unlink(source);
+	int res = unlink(source);
+	if (res < 0) {
+		fprintf(stderr, APP_NAME ": %s: %s\n", source, strerror(errno));
+		return 1;
+	}
+	return 0;
 }
 
 static int rm_thing(char * tmp) {
@@ -50,29 +60,22 @@ static int rm_thing(char * tmp) {
 	lstat(tmp,&statbuf);
 	if (S_ISDIR(statbuf.st_mode)) {
 		if (!recursive) {
-			fprintf(stderr, "rm: %s: is a directory\n", tmp);
+			fprintf(stderr, APP_NAME ": %s: is a directory\n", tmp);
 			return 1;
 		}
 		return rm_directory(tmp);
 	} else {
-		return unlink(tmp);
+		int res = unlink(tmp);
+		if (res < 0) {
+			fprintf(stderr, APP_NAME ": %s: %s\n", tmp, strerror(errno));
+			return 1;
+		}
+		return 0;
 	}
 }
 
-
-int main(int argc, char * argv[]) {
-	int opt;
-	while ((opt = getopt(argc, argv, "r")) != -1) {
-		switch (opt) {
-			case 'r':
-				recursive = 1;
-				break;
-			default:
-				fprintf(stderr, "rm: unrecognized option '%c'\n", opt);
-				break;
-		}
-	}
-
+#ifndef IS_MV
+static int rm_top_level(char **argv, int argc, int optind) {
 	int ret = 0;
 
 	for (int i = optind; i < argc; ++i) {
@@ -81,3 +84,23 @@ int main(int argc, char * argv[]) {
 
 	return ret;
 }
+
+int main(int argc, char * argv[]) {
+	int opt;
+	while ((opt = getopt(argc, argv, "fr")) != -1) {
+		switch (opt) {
+			case 'r':
+				recursive = 1;
+				break;
+			case 'f':
+				/* ignore */
+				break;
+			default:
+				fprintf(stderr, "rm: unrecognized option '%c'\n", opt);
+				break;
+		}
+	}
+
+	return rm_top_level(argv, argc, optind);
+}
+#endif

@@ -119,36 +119,24 @@ int virtio_keyboard_responder(process_t * this, int irq, void * data) {
 	return 0;
 }
 
+static void try_to_get_boot_processor(void) {
+	/* We would prefer these virtio startup processes run on the boot CPU, but
+	 * it's not the end of the world if they don't. If we're not on the boot
+	 * CPU, yield for a bit to try to get on it... */
+	uint64_t expire = arch_perf_timer() + 100000UL * arch_cpu_mhz();
+	while (this_core->cpu_id != 0) {
+		if (arch_perf_timer() >= expire) break;
+		switch_task(1);
+	}
+}
+
 static void virtio_tablet_thread(void * data) {
-	while (this_core->cpu_id != 0) switch_task(1);
+	try_to_get_boot_processor();
 
 	uint32_t device = (uintptr_t)data;
 	uintptr_t t = 0x12000000;
 	pci_write_field(device, PCI_BAR4, 4, t|8);
 	pci_write_field(device, PCI_COMMAND, 2, 4|2|1);
-
-	uint8_t caps = pci_read_field(device, 0x34, 1) & 0xFC;
-	dprintf("virtio: capabilities at 0x%02x\n", caps);
-
-	if (caps) {
-		uint8_t next = caps;
-		do {
-			uint8_t cap_id = pci_read_field(device, next, 1);
-			dprintf("@%d cap %d\n", next, cap_id);
-			if (cap_id == 9) {
-				/* vendor cap */
-				uint8_t len  = pci_read_field(device, next+2, 1);
-				uint8_t type = pci_read_field(device, next+3, 1);
-				uint8_t bar  = pci_read_field(device, next+4, 1);
-				uint32_t off = pci_read_field(device, next+8, 4);
-
-				dprintf("len=%d type=%d bar=%d off=%#x\n",
-					len, type, bar, off);
-
-			}
-			next = pci_read_field(device, next+1, 1);
-		} while (next);
-	}
 
 	struct virtio_device_cfg * cfg = (void*)((char*)mmu_map_mmio_region(t + 0x2000, 0x1000));
 	cfg->select = 1; /* ask for name */
@@ -240,7 +228,7 @@ static void virtio_tablet_thread(void * data) {
 
 		uint16_t them = queue->used.index;
 
-		for (; index < them; index++) {
+		for (; index != them; index++) {
 			asm volatile ("dc ivac, %0\ndsb sy" :: "r"(&buffers[index%queue_size]) : "memory");
 			struct virtio_input_event evt = buffers[index%queue_size];
 			while (evt.type == 0xFF) {
@@ -309,10 +297,11 @@ static const uint8_t ext_key_map[256] = {
 	[0x6a] = 0x4D, /* RIGHT */
 	[0x6b] = 0x4F, /* end */
 	[0x6d] = 0x51, /* page down */
+	[0x7d] = 0x5b, /* left super */
 };
 
 static void virtio_keyboard_thread(void * data) {
-	while (this_core->cpu_id != 0) switch_task(1);
+	try_to_get_boot_processor();
 
 	uint32_t device = (uintptr_t)data;
 	uintptr_t t = 0x12100000;
@@ -387,7 +376,7 @@ static void virtio_keyboard_thread(void * data) {
 
 		uint16_t them = queue->used.index;
 
-		for (; index < them; index++) {
+		for (; index != them; index++) {
 			asm volatile ("dc ivac, %0\ndsb sy" :: "r"(&buffers[index%queue_size]) : "memory");
 			struct virtio_input_event evt = buffers[index%queue_size];
 			while (evt.type == 0xFF) {
@@ -398,7 +387,7 @@ static void virtio_keyboard_thread(void * data) {
 			asm volatile ("isb\ndsb sy" :: "r"(buffers) : "memory");
 			if (evt.type == 1) {
 				/* need to back-convert which is a pain in the ass */
-				if (evt.code < 0x40) {
+				if (evt.code < 0x49) {
 					uint8_t scancode = evt.code;
 					if (evt.value == 0) {
 						scancode |= 0x80;
@@ -429,9 +418,9 @@ static void virtio_keyboard_thread(void * data) {
 static void virtio_input_maybe(uint32_t device, uint16_t v, uint16_t d, void * extra) {
 	if (v == 0x1af4 && d == 0x1052) {
 		if (pci_find_type(device) == 0x0900) {
-			spawn_worker_thread(virtio_keyboard_thread, "virtio-keyboard", (void*)(uintptr_t)device);
+			spawn_worker_thread(virtio_keyboard_thread, "[virtio-keyboard]", (void*)(uintptr_t)device);
 		} else if (pci_find_type(device) == 0x0980) {
-			spawn_worker_thread(virtio_tablet_thread, "virtio-tablet", (void*)(uintptr_t)device);
+			spawn_worker_thread(virtio_tablet_thread, "[virtio-tablet]", (void*)(uintptr_t)device);
 		}
 	}
 
@@ -440,15 +429,15 @@ static void virtio_input_maybe(uint32_t device, uint16_t v, uint16_t d, void * e
 void null_input(void) {
 	mouse_pipe = make_pipe(128);
 	mouse_pipe->flags = FS_CHARDEVICE;
-	vfs_mount("/dev/mouse", mouse_pipe);
+	vfs_mount("/dev/mouse", mouse_pipe, "virtio-mouse", "");
 
 	vmmouse_pipe = make_pipe(4096);
 	vmmouse_pipe->flags = FS_CHARDEVICE;
-	vfs_mount("/dev/vmmouse", vmmouse_pipe);
+	vfs_mount("/dev/vmmouse", vmmouse_pipe, "virtio-tablet", "");
 
 	keyboard_pipe = make_pipe(128);
 	keyboard_pipe->flags = FS_CHARDEVICE;
-	vfs_mount("/dev/kbd", keyboard_pipe);
+	vfs_mount("/dev/kbd", keyboard_pipe, "virtio-kbd", "");
 
 }
 

@@ -180,7 +180,7 @@ static void write_char(int x, int y, int val, int attr) {
 
 	uint32_t colors[] = {bg_color, fg_color};
 
-	uint16_t * c = large_font[val];
+	uint8_t * c = large_font[val];
 	for (uint8_t i = 0; i < char_height; ++i) {
 		for (uint8_t j = 0; j < char_width; ++j) {
 			set_point(x+j,y+i,colors[!!(c[i] & (1 << LARGE_FONT_MASK-j))]);
@@ -303,7 +303,14 @@ static void draw_square(int x, int y, int stage) {
 }
 
 void draw_logo(int stage) {
-	if (!in_graphics_mode) return;
+	if (!in_graphics_mode) {
+		move_cursor(0,0);
+		print_("Loading... ");
+		char tmp[2] = {0};
+		tmp[0] = "/-\\|/-\\|"[stage];
+		print_(tmp);
+		return;
+	}
 	uint64_t logo_squares = 0x00183c7effff6600UL;
 	for (int y = 0; y < 8; ++y) {
 		for (int x = 0; x < 8; ++x) {

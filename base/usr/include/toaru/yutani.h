@@ -113,6 +113,7 @@ struct yutani_msg_window_new_flags {
 	uint32_t width;
 	uint32_t height;
 	uint32_t flags;
+	yutani_wid_t parent_wid;
 };
 
 struct yutani_msg_window_init {
@@ -256,6 +257,19 @@ struct yutani_msg_clipboard {
 	char content[];
 };
 
+struct yutani_msg_window_panel_size {
+	yutani_wid_t wid;
+	int32_t x;
+	int32_t y;
+	int32_t w;
+	int32_t h;
+};
+
+struct yutani_msg_window_set_parent {
+	yutani_wid_t wid;
+	yutani_wid_t parent_wid;
+};
+
 /* Magic value */
 #define YUTANI_MSG__MAGIC 0xABAD1DEA
 
@@ -282,6 +296,7 @@ struct yutani_msg_clipboard {
 #define YUTANI_MSG_RESIZE_DONE         0x00000014
 
 #define YUTANI_MSG_WINDOW_MOVE_RELATIVE 0x00000015
+#define YUTANI_MSG_WINDOW_SET_PARENT    0x00000016
 
 /* Some session management / de stuff */
 #define YUTANI_MSG_WINDOW_ADVERTISE    0x00000020
@@ -294,6 +309,7 @@ struct yutani_msg_clipboard {
 #define YUTANI_MSG_WINDOW_WARP_MOUSE   0x00000027
 #define YUTANI_MSG_WINDOW_SHOW_MOUSE   0x00000028
 #define YUTANI_MSG_WINDOW_RESIZE_START 0x00000029
+#define YUTANI_MSG_WINDOW_PANEL_SIZE   0x0000002a
 
 #define YUTANI_MSG_SESSION_END         0x00000030
 
@@ -480,6 +496,8 @@ struct yutani_msg_clipboard {
 #define YUTANI_WINDOW_FLAG_ALT_ANIMATION    (1 << 3)
 #define YUTANI_WINDOW_FLAG_DIALOG_ANIMATION (1 << 4)
 #define YUTANI_WINDOW_FLAG_NO_ANIMATION     (1 << 5)
+#define YUTANI_WINDOW_FLAG_BLUR_BEHIND      (1 << 8)
+#define YUTANI_WINDOW_FLAG_PARENT_WID       (1 << 9)
 
 /* YUTANI_SPECIAL_REQUEST
  *
@@ -487,6 +505,7 @@ struct yutani_msg_clipboard {
  */
 #define YUTANI_SPECIAL_REQUEST_MAXIMIZE     1
 #define YUTANI_SPECIAL_REQUEST_PLEASE_CLOSE 2
+#define YUTANI_SPECIAL_REQUEST_MINIMIZE     3
 
 #define YUTANI_SPECIAL_REQUEST_CLIPBOARD    10
 
@@ -521,10 +540,11 @@ extern int yutani_msg_send(yutani_t * y, yutani_msg_t * msg);
 extern yutani_t * yutani_context_create(FILE * socket);
 extern yutani_t * yutani_init(void);
 extern yutani_window_t * yutani_window_create(yutani_t * y, int width, int height);
-extern yutani_window_t * yutani_window_create_flags(yutani_t * y, int width, int height, uint32_t flags);
+extern yutani_window_t * yutani_window_create_flags(yutani_t * y, int width, int height, uint32_t flags, ...);
 extern void yutani_flip(yutani_t * y, yutani_window_t * win);
 extern void yutani_window_move(yutani_t * yctx, yutani_window_t * window, int x, int y);
 extern void yutani_window_move_relative(yutani_t * yctx, yutani_window_t * window, yutani_window_t * base, int x, int y);
+extern void yutani_window_set_parent(yutani_t * yctx, yutani_window_t * window, yutani_window_t * parent);
 extern void yutani_close(yutani_t * y, yutani_window_t * win);
 extern void yutani_set_stack(yutani_t *, yutani_window_t *, int);
 extern void yutani_flip_region(yutani_t *, yutani_window_t * win, int32_t x, int32_t y, int32_t width, int32_t height);
@@ -534,6 +554,7 @@ extern void yutani_window_resize_accept(yutani_t * yctx, yutani_window_t * windo
 extern void yutani_window_resize_done(yutani_t * yctx, yutani_window_t * window);
 extern void yutani_window_advertise(yutani_t * yctx, yutani_window_t * window, char * name);
 extern void yutani_window_advertise_icon(yutani_t * yctx, yutani_window_t * window, char * name, char * icon);
+extern void yutani_window_panel_size(yutani_t * yctx, yutani_wid_t wid, int32_t x, int32_t y, int32_t w, int32_t h);
 extern void yutani_subscribe_windows(yutani_t * y);
 extern void yutani_unsubscribe_windows(yutani_t * y);
 extern void yutani_query_windows(yutani_t * y);
@@ -555,6 +576,7 @@ extern gfx_context_t * init_graphics_yutani(yutani_window_t * window);
 extern gfx_context_t *  init_graphics_yutani_double_buffer(yutani_window_t * window);
 extern void reinit_graphics_yutani(gfx_context_t * out, yutani_window_t * window);
 extern void release_graphics_yutani(gfx_context_t * gfx);
+extern void yutani_internal_refocus(yutani_t * yctx, yutani_window_t * window);
 
 _End_C_Header
 

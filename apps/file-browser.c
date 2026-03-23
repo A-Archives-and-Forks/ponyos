@@ -9,7 +9,7 @@
  * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2018-2021 K. Lange
+ * Copyright (C) 2018-2022 K. Lange
  */
 #include <stdio.h>
 #include <unistd.h>
@@ -84,6 +84,9 @@ static struct TT_Font * tt_font_bold = NULL;
 static struct MenuEntry * _menu_entry_show_icons = NULL;
 static struct MenuEntry * _menu_entry_show_tiles = NULL;
 static struct MenuEntry * _menu_entry_show_list  = NULL;
+static struct MenuEntry * _menu_entry_up = NULL;
+static struct MenuEntry * _menu_entry_up_ctx_a = NULL;
+static struct MenuEntry * _menu_entry_up_ctx_b = NULL;
 
 /**
  * Navigation input box
@@ -211,28 +214,6 @@ static int print_human_readable_size(char * _out, uint64_t s) {
 #define HILIGHT_BORDER_BOTTOM rgb(132,17,132)
 
 /**
- * Clip text and add ellipsis to fit a specified display width.
- */
-static char * ellipsify(char * input, int font_size, struct TT_Font * font, int max_width, int * out_width) {
-	int len = strlen(input);
-	char * out = malloc(len + 4);
-	memcpy(out, input, len + 1);
-	int width;
-	tt_set_size(font, font_size);
-	while ((width = tt_string_width(font, out)) > max_width) {
-		len--;
-		out[len+0] = '.';
-		out[len+1] = '.';
-		out[len+2] = '.';
-		out[len+3] = '\0';
-	}
-
-	if (out_width) *out_width = width;
-
-	return out;
-}
-
-/**
  * Draw an icon view entry
  */
 static void draw_file(struct File * f, int offset) {
@@ -249,7 +230,7 @@ static void draw_file(struct File * f, int offset) {
 
 		/* If the display name is too long to fit, cut it with an ellipsis. */
 		int name_width;
-		char * name = ellipsify(f->name, 13, tt_font_thin, FILE_WIDTH - 8, &name_width);
+		char * name = tt_ellipsify(f->name, 13, tt_font_thin, FILE_WIDTH - 8, &name_width);
 
 		/* Draw the icon */
 		int center_x_icon = (FILE_WIDTH - icon->width) / 2;
@@ -257,14 +238,16 @@ static void draw_file(struct File * f, int offset) {
 		draw_sprite(contents, icon, center_x_icon + x, y + 2);
 
 		if (f->selected) {
+			tt_set_size(tt_font_thin, 13);
 			/* If this file is selected, paint the icon blue... */
 			if (main_window->focused) {
-				draw_sprite_alpha_paint(contents, icon, center_x_icon + x, y + 2, 0.5, rgb(255,72,254));
+				draw_sprite_alpha_paint(contents, icon, center_x_icon + x, y + 2, 0.5, rgb(255,27,254));
+				draw_rounded_rectangle(contents, center_x_text + x - 2, y + 53, name_width + 6, 20, 3, rgb(255,72,254));
+				tt_draw_string(contents, tt_font_thin, center_x_text + x, y + 54 + 13, name, rgb(255,255,255));
+			} else {
+				draw_rounded_rectangle(contents, center_x_text + x - 2, y + 53, name_width + 6, 20, 3, rgb(190,190,190));
+				tt_draw_string(contents, tt_font_thin, center_x_text + x, y + 54 + 13, name, rgb(20,20,20));
 			}
-			/* And draw the name with a blue background and white text */
-			draw_rounded_rectangle(contents, center_x_text + x - 2, y + 54, name_width + 6, 20, 3, rgb(255,72,254));
-			tt_set_size(tt_font_thin, 13);
-			tt_draw_string(contents, tt_font_thin, center_x_text + x, y + 54 + 13, name, rgb(255,255,255));
 		} else {
 			if (is_desktop_background) {
 				/* If this is the desktop view, white text with a drop shadow */
@@ -309,8 +292,8 @@ static void draw_file(struct File * f, int offset) {
 			draw_sprite_alpha_paint(contents, icon, x + 11, y + 11, 0.3, rgb(255,255,255));
 		}
 
-		char * name = ellipsify(f->name, 13, tt_font_bold, FILE_WIDTH - 81, NULL);
-		char * type = ellipsify(f->filetype, 13, tt_font_thin, FILE_WIDTH - 81, NULL);
+		char * name = tt_ellipsify(f->name, 13, tt_font_bold, FILE_WIDTH - 81, NULL);
+		char * type = tt_ellipsify(f->filetype, 13, tt_font_thin, FILE_WIDTH - 81, NULL);
 
 		if (f->type == 0) {
 			tt_set_size(tt_font_bold, 13);
@@ -356,7 +339,7 @@ static void draw_file(struct File * f, int offset) {
 			draw_sprite(contents, icon, x + 4, y + 4);
 		}
 
-		char * name = ellipsify(f->name, 13, tt_font_thin, FILE_WIDTH - 26, NULL);
+		char * name = tt_ellipsify(f->name, 13, tt_font_thin, FILE_WIDTH - 26, NULL);
 
 		tt_set_size(tt_font_thin, 13);
 		tt_draw_string(contents, tt_font_thin, x + 24, y + 15, name, text_color);
@@ -539,6 +522,11 @@ static void load_directory(const char * path, int modifies_history) {
 		set_title(base);
 		free(tmp);
 	}
+
+	extern void menu_update_enabled(struct MenuEntry*, int);
+	if (_menu_entry_up) menu_update_enabled(_menu_entry_up, !_button_disabled[2]);
+	if (_menu_entry_up_ctx_a) menu_update_enabled(_menu_entry_up_ctx_a, !_button_disabled[2]);
+	if (_menu_entry_up_ctx_b) menu_update_enabled(_menu_entry_up_ctx_b, !_button_disabled[2]);
 
 	/* If we ended up in a path with //two/initial/slashes, fix that. */
 	if (path[0] == '/' && path[1] == '/') {
@@ -949,7 +937,7 @@ static void _draw_nav_bar(struct decor_bounds bounds) {
 	}
 
 	/* Draw input box */
-	if (nav_bar_focused) {
+	if (nav_bar_focused && main_window->focused) {
 		struct gradient_definition edge = {28, bounds.top_height + menu_bar_height + 3, rgb(0,120,220), rgb(0,120,220)};
 		draw_rounded_rectangle_pattern(ctx, bounds.left_width + 2 + x + 1, bounds.top_height + menu_bar_height + 4, main_window->width - bounds.width - x - 6, 26, 4, gfx_vertical_gradient_pattern, &edge);
 		draw_rounded_rectangle(ctx, bounds.left_width + 2 + x + 3, bounds.top_height + menu_bar_height + 6, main_window->width - bounds.width - x - 10, 22, 2, rgb(250,250,250));
@@ -961,11 +949,11 @@ static void _draw_nav_bar(struct decor_bounds bounds) {
 
 	/* Draw the nav bar text, ellipsified if needed */
 	int max_width = main_window->width - bounds.width - x - 12;
-	char * name = ellipsify(nav_bar, 13, tt_font_thin, max_width, NULL);
+	char * name = tt_ellipsify(nav_bar, 13, tt_font_thin, max_width, NULL);
 	tt_draw_string(ctx, tt_font_thin, bounds.left_width + 2 + x + 5, bounds.top_height + menu_bar_height + 8 + 13, name, rgb(0,0,0));
 	free(name);
 
-	if (nav_bar_focused && !nav_bar_blink) {
+	if (nav_bar_focused && main_window->focused && !nav_bar_blink) {
 		/* Draw cursor indicator at cursor_x */
 		draw_line(ctx,
 				bounds.left_width + 2 + x + 5 + nav_bar_cursor_x,
@@ -1445,11 +1433,49 @@ static void _menu_action_paste(struct MenuEntry * entry) {
 	yutani_special_request(yctx, NULL, YUTANI_SPECIAL_REQUEST_CLIPBOARD);
 }
 
+static void _menu_action_delete(struct MenuEntry * entry) {
+	size_t filesToDelete = 0;
+	for (int i = 0; i < file_pointers_len; ++i) {
+		if (file_pointers[i]->selected) filesToDelete++;
+	}
+
+	int base_is_root = !strcmp(current_directory, "/"); /* avoid redundant slash */
+	char ** args = malloc(sizeof(char*) * (filesToDelete + 3));
+	args[0] = "/bin/prompt_and_delete.krk";
+	args[1] = malloc(100);
+	snprintf(args[1],100,"%d",getpid());
+	size_t counter = 2;
+	for (int i = 0; i < file_pointers_len; ++i) {
+		if (file_pointers[i]->selected) {
+			const char * name = file_pointers[i]->type == 2 ? file_pointers[i]->filename : file_pointers[i]->name;
+			size_t len = strlen(current_directory) + !base_is_root + strlen(name) + 1;
+			args[counter] = malloc(len);
+			snprintf(args[counter], len, "%s%s%s", current_directory, base_is_root ? "" : "/", name);
+			counter++;
+		}
+	}
+	args[counter] = NULL;
+
+	pid_t child = fork();
+
+	if (!child) {
+		execv(args[0], args);
+		exit(1);
+	} else if (child < 0) {
+		fprintf(stderr, "Error forking.\n");
+	}
+
+	for (size_t i = 1; i < counter; ++i) {
+		free(args[i]);
+	}
+	free(args);
+}
+
 /* Help > About File Browser */
 static void _menu_action_about(struct MenuEntry * entry) {
 	/* Show About dialog */
 	char about_cmd[1024] = "\0";
-	strcat(about_cmd, "about \"About File Browser\" /usr/share/icons/48/folder.png \"PonyOS File Browser\" \"© 2018-2021 K. Lange\n-\nPart of PonyOS, which is free software\nreleased under the NCSA/University of Illinois\nlicense.\n-\n%https://toaruos.org\n%https://github.com/klange/toaruos\" ");
+	strcat(about_cmd, "about \"About File Browser\" /usr/share/icons/48/folder.png \"PonyOS File Browser\" \"© 2018-2026 K. Lange\n-\nPart of PonyOS, which is free software\nreleased under the NCSA/University of Illinois\nlicense.\n-\n%https://toaruos.org\n%https://github.com/klange/toaruos\" ");
 	char coords[100];
 	sprintf(coords, "%d %d &", (int)main_window->x + (int)main_window->width / 2, (int)main_window->y + (int)main_window->height / 2);
 	strcat(about_cmd, coords);
@@ -1544,7 +1570,7 @@ static void _menu_action_edit(struct MenuEntry * self) {
 /* View > (Show/Hide) Hidden Files */
 static void _menu_action_toggle_hidden(struct MenuEntry * self) {
 	show_hidden = !show_hidden;
-	menu_update_icon(self, show_hidden ? "check" : NULL);
+	menu_update_toggle_state(self, show_hidden);
 	_menu_action_refresh(NULL);
 }
 
@@ -1602,9 +1628,9 @@ static void _menu_action_view_mode(struct MenuEntry * entry) {
 		mode = VIEW_MODE_LIST;
 	}
 	set_view_mode(mode);
-	menu_update_icon(_menu_entry_show_icons, view_mode == VIEW_MODE_ICONS ? "check" : NULL);
-	menu_update_icon(_menu_entry_show_tiles, view_mode == VIEW_MODE_TILES ? "check" : NULL);
-	menu_update_icon(_menu_entry_show_list,  view_mode == VIEW_MODE_LIST  ? "check" : NULL);
+	menu_update_toggle_state(_menu_entry_show_icons, view_mode == VIEW_MODE_ICONS);
+	menu_update_toggle_state(_menu_entry_show_tiles, view_mode == VIEW_MODE_TILES);
+	menu_update_toggle_state(_menu_entry_show_list,  view_mode == VIEW_MODE_LIST);
 	reinitialize_contents();
 	redraw_window();
 }
@@ -1787,14 +1813,14 @@ static void _scroll_down(void) {
 	}
 }
 
+static int signalResponse = 0;
+
 /**
  * Desktop mode responsds to sig_usr2 by returning to
  * the bottom of the Z-order stack.
  */
 static void sig_usr2(int sig) {
-	yutani_set_stack(yctx, main_window, YUTANI_ZORDER_BOTTOM);
-	_menu_action_refresh(NULL);
-	signal(SIGUSR2, sig_usr2);
+	signalResponse |= 1;
 }
 
 /**
@@ -1802,8 +1828,11 @@ static void sig_usr2(int sig) {
  * to the current display size.
  */
 static void sig_usr1(int sig) {
-	yutani_window_resize_offer(yctx, main_window, yctx->display_width, yctx->display_height);
-	signal(SIGUSR1, sig_usr1);
+	signalResponse |= 2;
+}
+
+static void sig_urg(int sig) {
+	signalResponse |= 4;
 }
 
 /**
@@ -1893,6 +1922,14 @@ static void show_context_menu(struct yutani_msg_window_mouse_event * me) {
 	}
 }
 
+static void set_signal_handler(int signum, void (*handler)(int)) {
+	struct sigaction action;
+	action.sa_handler = handler;
+	sigemptyset(&action.sa_mask);
+	action.sa_flags = 0; /* do not restart syscalls, do not reset handler */
+	sigaction(signum, &action, NULL);
+}
+
 int main(int argc, char * argv[]) {
 
 	yctx = yutani_init();
@@ -1907,8 +1944,8 @@ int main(int argc, char * argv[]) {
 		is_desktop_background = 1;
 		menu_bar_height = 0;
 		nav_bar_height = 0;
-		signal(SIGUSR1, sig_usr1);
-		signal(SIGUSR2, sig_usr2);
+		set_signal_handler(SIGUSR1, sig_usr1);
+		set_signal_handler(SIGUSR2, sig_usr2);
 		draw_background(yctx->display_width, yctx->display_height);
 		main_window = yutani_window_create_flags(yctx, yctx->display_width, yctx->display_height, YUTANI_WINDOW_FLAG_NO_STEAL_FOCUS);
 		yutani_window_move(yctx, main_window, 0, 0);
@@ -1929,6 +1966,8 @@ int main(int argc, char * argv[]) {
 		yutani_window_move(yctx, main_window, yctx->display_width / 2 - main_window->width / 2, yctx->display_height / 2 - main_window->height / 2);
 		set_view_mode(VIEW_MODE_TILES);
 	}
+
+	set_signal_handler(SIGURG, sig_urg);
 
 	if (arg_ind < argc) {
 		chdir(argv[arg_ind]);
@@ -1961,17 +2000,17 @@ int main(int argc, char * argv[]) {
 		m = menu_create();
 		menu_insert(m, menu_create_normal("refresh",NULL,"Refresh", _menu_action_refresh));
 		menu_insert(m, menu_create_separator());
-		menu_insert(m, (_menu_entry_show_icons = menu_create_normal(view_mode == VIEW_MODE_ICONS ? "check" : NULL,"icons","Show Icons", _menu_action_view_mode)));
-		menu_insert(m, (_menu_entry_show_tiles = menu_create_normal(view_mode == VIEW_MODE_TILES ? "check" : NULL,"tiles","Show Tiles", _menu_action_view_mode)));
-		menu_insert(m, (_menu_entry_show_list  = menu_create_normal(view_mode == VIEW_MODE_LIST  ? "check" : NULL,"list", "Show List",  _menu_action_view_mode)));
+		menu_insert(m, (_menu_entry_show_icons = menu_create_toggle("icons","Show Icons", view_mode == VIEW_MODE_ICONS, _menu_action_view_mode)));
+		menu_insert(m, (_menu_entry_show_tiles = menu_create_toggle("tiles","Show Tiles", view_mode == VIEW_MODE_TILES, _menu_action_view_mode)));
+		menu_insert(m, (_menu_entry_show_list  = menu_create_toggle("list", "Show List",  view_mode == VIEW_MODE_LIST,  _menu_action_view_mode)));
 		menu_insert(m, menu_create_separator());
-		menu_insert(m, menu_create_normal(NULL,NULL,"Show Hidden Files", _menu_action_toggle_hidden));
+		menu_insert(m, menu_create_toggle(NULL,"Show Hidden Files", 0, _menu_action_toggle_hidden));
 		menu_set_insert(menu_bar.set, "view", m);
 
 		m = menu_create(); /* Go */
 		menu_insert(m, menu_create_normal("home",getenv("HOME"),"Home",_menu_action_navigate));
 		menu_insert(m, menu_create_normal(NULL,"/","File System",_menu_action_navigate));
-		menu_insert(m, menu_create_normal("up",NULL,"Up",_menu_action_up));
+		menu_insert(m, (_menu_entry_up = menu_create_normal("up",NULL,"Up",_menu_action_up)));
 		menu_set_insert(menu_bar.set, "go", m);
 
 		m = menu_create();
@@ -1990,8 +2029,10 @@ int main(int argc, char * argv[]) {
 	menu_insert(context_menu, menu_create_normal(NULL,NULL,"Copy",_menu_action_copy));
 	menu_insert(context_menu, menu_create_normal(NULL,NULL,"Paste",_menu_action_paste));
 	menu_insert(context_menu, menu_create_separator());
+	menu_insert(context_menu, menu_create_normal(NULL,NULL,"Delete",_menu_action_delete));
 	if (!is_desktop_background) {
-		menu_insert(context_menu, menu_create_normal("up",NULL,"Up",_menu_action_up));
+		menu_insert(context_menu, menu_create_separator());
+		menu_insert(context_menu, (_menu_entry_up_ctx_a = menu_create_normal("up",NULL,"Up",_menu_action_up)));
 	}
 	menu_insert(context_menu, menu_create_normal("refresh",NULL,"Refresh",_menu_action_refresh));
 	menu_insert(context_menu, menu_create_normal("utilities-terminal","terminal","Open Terminal",launch_application_menu));
@@ -2000,7 +2041,7 @@ int main(int argc, char * argv[]) {
 	menu_insert(directory_context_menu, menu_create_normal(NULL,NULL,"Paste",_menu_action_paste));
 	menu_insert(directory_context_menu, menu_create_separator());
 	if (!is_desktop_background) {
-		menu_insert(directory_context_menu, menu_create_normal("up",NULL,"Up",_menu_action_up));
+		menu_insert(directory_context_menu, (_menu_entry_up_ctx_b = menu_create_normal("up",NULL,"Up",_menu_action_up)));
 	}
 	menu_insert(directory_context_menu, menu_create_normal("refresh",NULL,"Refresh",_menu_action_refresh));
 	menu_insert(directory_context_menu, menu_create_normal("utilities-terminal","terminal","Open Terminal",launch_application_menu));
@@ -2023,6 +2064,19 @@ int main(int argc, char * argv[]) {
 		waitpid(-1, NULL, WNOHANG);
 		int fds[1] = {fileno(yctx->sock)};
 		int index = fswait2(1,fds,wallpaper_old ? 10 : 200);
+
+		if (index < 0 && signalResponse) {
+			if (signalResponse & 1) {
+				yutani_set_stack(yctx, main_window, YUTANI_ZORDER_BOTTOM);
+				_menu_action_refresh(NULL);
+			} else if (signalResponse & 2) {
+				yutani_window_resize_offer(yctx, main_window, yctx->display_width, yctx->display_height);
+			} else if (signalResponse & 4) {
+				_menu_action_refresh(NULL);
+			}
+			signalResponse = 0;
+			continue;
+		}
 
 		maybe_blink_cursor();
 
@@ -2116,7 +2170,9 @@ int main(int argc, char * argv[]) {
 									arrow_select(1,0);
 									break;
 								case KEY_BACKSPACE:
-									_menu_action_up(NULL);
+									if (!is_desktop_background) {
+										_menu_action_up(NULL);
+									}
 									break;
 								case '\n':
 									_menu_action_open(NULL);

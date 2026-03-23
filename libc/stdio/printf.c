@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <va_list.h>
 
 #define OUT(c) do { callback(userData, (c)); written++; } while (0)
@@ -116,6 +118,52 @@ static size_t print_hex(unsigned long long value, unsigned int width, int (*call
 	return written;
 }
 
+static size_t print_oct(unsigned long long value, unsigned int width, int (*callback)(void*,char), void* userData, int fill_zero, int alt, int caps, int align) {
+	size_t written = 0;
+	int i = width;
+
+	unsigned long long n_width = 1;
+	unsigned long long j = 7;
+	while (value > j && j < UINT64_MAX) {
+		n_width += 1;
+		j *= 8;
+		j += 7;
+	}
+
+	if (!fill_zero && align == 1) {
+		while (i > (long long)n_width + !!alt) {
+			OUT(' ');
+			i--;
+		}
+	}
+
+	if (alt) {
+		OUT('0');
+	}
+
+	if (fill_zero && align == 1) {
+		while (i > (long long)n_width + !!alt) {
+			OUT('0');
+			i--;
+		}
+	}
+
+	i = (long long)n_width;
+	while (i-- > 0) {
+		char c = "01234567"[(value>>(i*3))&0x7];
+		OUT(c);
+	}
+
+	if (align == 0) {
+		i = width;
+		while (i > (long long)n_width + !!alt) {
+			OUT(' ');
+			i--;
+		}
+	}
+
+	return written;
+}
 /*
  * vasprintf()
  */
@@ -143,7 +191,7 @@ size_t xvasprintf(int (*callback)(void *, char), void * userData, const char * f
 				alt = 1;
 				++f;
 			} else if (*f == '*') {
-				arg_width = (char)va_arg(args, int);
+				arg_width = (int)va_arg(args, int);
 				++f;
 			} else if (*f == '0') {
 				fill_zero = 1;
@@ -253,6 +301,20 @@ size_t xvasprintf(int (*callback)(void *, char), void * userData, const char * f
 					written += print_hex(val, arg_width, callback, userData, fill_zero, alt, !(*f & 32), align);
 				}
 				break;
+			case 'O':
+			case 'o': /* Octal number */
+				{
+					unsigned long long val;
+					if (big == 2) {
+						val = (unsigned long long)va_arg(args, unsigned long long);
+					} else if (big == 1) {
+						val = (unsigned long)va_arg(args, unsigned long);
+					} else {
+						val = (unsigned int)va_arg(args, unsigned int);
+					}
+					written += print_oct(val, arg_width, callback, userData, fill_zero, alt, !(*f & 32), align);
+				}
+				break;
 			case 'i':
 			case 'd': /* Decimal number */
 				{
@@ -340,7 +402,7 @@ size_t xvasprintf(int (*callback)(void *, char), void * userData, const char * f
 						val = val - (unsigned long long)val;
 						val *= 10.0;
 						double roundy = ((double)(val - (unsigned long long)val) - 0.99999);
-						if (roundy < 0.00001 && roundy > -0.00001) {
+						if (roundy < 0.00001 && roundy > -0.00001 && ((unsigned long long)(val) % 10) != 9) {
 							written += print_dec((unsigned long long)(val) % 10 + 1, 0, callback, userData, 0, 0, 1);
 							break;
 						}
@@ -438,12 +500,19 @@ static int cb_asprintf(void * user, char c) {
 
 int vasprintf(char ** buf, const char * fmt, va_list args) {
 	struct CBData data = {NULL,0,0};
-	int out = xvasprintf(cb_asprintf, &data, fmt, args);
+	xvasprintf(cb_asprintf, &data, fmt, args);
 	cb_asprintf(&data, '\0');
 	*buf = data.str;
-	return out;
+	return 0;
 }
 
+int asprintf(char ** ret, const char * fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	int out = vasprintf(ret,fmt,args);
+	va_end(args);
+	return out;
+}
 
 /* Streams */
 

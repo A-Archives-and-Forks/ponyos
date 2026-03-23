@@ -15,6 +15,7 @@
 #include <kernel/string.h>
 #include <kernel/args.h>
 #include <kernel/mmu.h>
+#include <kernel/video.h>
 
 /* Whether to scroll or wrap when cursor reaches the bottom. */
 static int fbterm_scroll = 0;
@@ -29,14 +30,6 @@ static int term_state = 0;
 static char term_buf[1024] = {0};
 static int term_buf_c = 0;
 
-/* Is this in a header somewhere? */
-extern uint8_t * lfb_vid_memory;
-extern uint16_t lfb_resolution_x;
-extern uint16_t lfb_resolution_y;
-extern uint16_t lfb_resolution_b;
-extern uint32_t lfb_resolution_s;
-extern size_t lfb_memsize;
-
 /* Bitmap font details */
 #include "../../apps/terminal-font.h"
 #define char_height LARGE_FONT_CELL_HEIGHT
@@ -48,8 +41,6 @@ extern size_t lfb_memsize;
 
 static uint32_t fg_color = FG_COLOR;
 static uint32_t bg_color = BG_COLOR;
-
-extern uint32_t lfb_resolution_s;
 
 static inline void set_point(int x, int y, uint32_t value) {
 	if (lfb_resolution_b == 32) {
@@ -73,7 +64,7 @@ static void fb_write_char(int _x, int _y, int val, uint32_t color) {
 	int x = 1 + _x * char_width;
 	int y = _y * char_height;
 
-	uint16_t * c = large_font[val];
+	uint8_t * c = large_font[val];
 	for (uint8_t i = 0; i < char_height; ++i) {
 		for (uint8_t j = 0; j < char_width; ++j) {
 			if (c[i] & (1 << (LARGE_FONT_MASK-j))) {
@@ -132,7 +123,7 @@ static void draw_square(int x, int y) {
 	}
 }
 
-static void fbterm_draw_logo(void) {
+void fbterm_draw_logo(void) {
 	uint64_t logo_squares = 0x00183c7effff6600UL;
 	for (size_t y = 0; y < 8; ++y) {
 		for (size_t x = 0; x < 8; ++x) {
@@ -142,6 +133,14 @@ static void fbterm_draw_logo(void) {
 		}
 		logo_squares >>= 8;
 	}
+}
+
+void fbterm_reset(void) {
+	x = 0;
+	y = 0;
+	term_state = 0;
+	fg_color = FG_COLOR;
+	bg_color = BG_COLOR;
 }
 
 static void fbterm_init_framebuffer(void) {

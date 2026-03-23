@@ -23,6 +23,8 @@ _Begin_C_Header
 #define F_GETFL 3
 #define F_SETFL 4
 
+#define F_DUPFD 10
+
 /* Advisory locks are not currently supported;
  * these definitions are stubs. */
 #define F_GETLK  5
@@ -46,6 +48,7 @@ struct flock {
 #ifndef __kernel__
 extern int open (const char *, int, ...);
 extern int chmod(const char *path, mode_t mode);
+extern int fchmod(int fd, mode_t mode);
 extern int fcntl(int fd, int cmd, ...);
 #endif
 

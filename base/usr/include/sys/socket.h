@@ -10,15 +10,18 @@ _Begin_C_Header
 #define AF_INET 1
 #define AF_RAW 2
 
+#define PF_INET AF_INET
+
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
 #define SOCK_RAW    3
 
+#define IPPROTO_IP  0
 #define IPPROTO_ICMP 1
 #define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
 
-#define SOL_SOCKET 0
+#define SOL_SOCKET 1
 
 #define SO_KEEPALIVE 1
 #define SO_REUSEADDR 2
@@ -61,6 +64,15 @@ struct sockaddr_storage {
 	unsigned short ss_family;
 	char _ss_pad[128];
 };
+
+struct cmsghdr {
+	socklen_t cmsg_len;
+	int cmsg_level;
+	int cmsg_type;
+	unsigned char cmsg_data[];
+};
+
+#define CMSG_DATA(cmsg) (&((struct cmsghdr*)(cmsg))->cmsg_data)
 
 #ifndef _KERNEL_
 extern ssize_t recv(int sockfd, void *buf, size_t len, int flags);

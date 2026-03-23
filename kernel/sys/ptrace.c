@@ -164,7 +164,7 @@ long ptrace_signal(int signal, int reason) {
 	switch_task(0);
 
 	int signum = (this_core->current_process->status >> 8);
-	this_core->current_process->status = 0x7F;
+	this_core->current_process->status = 0;
 	return signum;
 }
 
@@ -184,7 +184,7 @@ static void signal_and_continue(pid_t pid, process_t * tracee, int sig) {
 	__sync_and_and_fetch(&tracee->flags, ~(PROC_FLAG_SUSPENDED));
 
 	/* Does the process have a pending signal? */
-	if ((tracee->status >> 8) & 0xFF && !(tracee->status >> 16)) {
+	if ((tracee->status >> 8) & 0xFF && (!(tracee->status >> 16) || ((tracee->status >> 16) == 0xFF))) {
 		tracee->status = (sig << 8);
 		make_process_ready(tracee);
 	} else if (sig) {
@@ -248,15 +248,10 @@ long ptrace_detach(pid_t pid, int sig) {
  * Copies the interrupt register context of the tracee into a tracer-provided
  * address. The size, meaning, and layout of the data copied is architecture-dependent.
  *
- * Currently this is either @c interrupt_registers or @c syscall_registers, depending
- * on what is available. Since the tracee needs to be suspended this should represent
- * the actual userspace register context when it resumes.
- *
  * On AArch64 we also add ELR, which isn't in the interrupt or syscall register contexts,
  * but pushed somewhere else...
  *
  * TODO We should support reading FPU regs as well.
- * TODO @c PTRACE_SETREGS so we can modify them.
  *
  * @param pid Tracee ID
  * @param data Address in tracer to write data into.
@@ -268,9 +263,32 @@ long ptrace_getregs(pid_t pid, void * data) {
 	if (!tracee || (tracee->tracer != this_core->current_process->id) || !(tracee->flags & PROC_FLAG_SUSPENDED)) return -ESRCH;
 
 	/* Copy registers */
-	memcpy(data, tracee->interrupt_registers ? tracee->interrupt_registers : tracee->syscall_registers, sizeof(struct regs));
+	memcpy(data, tracee->syscall_registers, sizeof(struct regs));
 #ifdef __aarch64__
 	memcpy((char*)data + sizeof(struct regs), &tracee->thread.context.saved[10], sizeof(uintptr_t));
+#endif
+
+	return 0;
+}
+
+/**
+ * @brief Modify the registers of the tracee.
+ *
+ * @ref PTRACE_SETREGS
+ *
+ * @param pid Tracee ID
+ * @param data Address in tracer to read data from.
+ * @returns 0 on success, -ESRCH if tracee is invalid.
+ */
+long ptrace_setregs(pid_t pid, void * data) {
+	if (!data || ptr_validate(data, "ptrace")) return -EFAULT;
+	process_t * tracee = process_from_pid(pid);
+	if (!tracee || (tracee->tracer != this_core->current_process->id) || !(tracee->flags & PROC_FLAG_SUSPENDED)) return -ESRCH;
+
+	/* Copy registers */
+	memcpy(tracee->syscall_registers, data, sizeof(struct regs));
+#ifdef __aarch64__
+	memcpy(&tracee->thread.context.saved[10], (char*)data + sizeof(struct regs), sizeof(uintptr_t));
 #endif
 
 	return 0;
@@ -398,7 +416,7 @@ long ptrace_singlestep(pid_t pid, int sig) {
 
 	/* arch_set_singlestep? */
 	#if defined(__x86_64__)
-	struct regs * target = tracee->interrupt_registers ? tracee->interrupt_registers : tracee->syscall_registers;
+	struct regs * target = tracee->syscall_registers;
 	target->rflags |= (1 << 8);
 	#elif defined(__aarch64__)
 	tracee->thread.context.saved[11] |= (1 << 21);
@@ -446,6 +464,8 @@ long ptrace_handle(long request, pid_t pid, void * addr, void * data) {
 			return ptrace_singlestep(pid,(uintptr_t)data);
 		case PTRACE_DETACH:
 			return ptrace_detach(pid,(uintptr_t)data);
+		case PTRACE_SETREGS:
+			return ptrace_setregs(pid,data);
 		default:
 			return -EINVAL;
 	}

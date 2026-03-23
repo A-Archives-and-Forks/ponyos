@@ -10,7 +10,7 @@
  * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2021 K. Lange
+ * Copyright (C) 2021-2023 K. Lange
  */
 #include <errno.h>
 #include <kernel/types.h>
@@ -37,6 +37,22 @@ void modules_install(void) {
 
 hashmap_t * modules_get_list(void) {
 	return _modules_table;
+}
+
+/**
+ * Encode immediate for ADR(p) instruction
+ */
+static uint32_t aarch64_imm_adr(uint32_t val) {
+	uint32_t low  = (val & 0x3) << 29;
+	uint32_t high = ((val >> 2) & 0x7ffff) << 5;
+	return low | high;
+}
+
+/**
+ * Encode immediate for 12-bit instructions
+ */
+static uint32_t aarch64_imm_12(uint32_t val) {
+	return (val & 0xFFF) << 10;
 }
 
 int elf_module(char ** args) {
@@ -79,15 +95,6 @@ int elf_module(char ** args) {
 	read_fs(file, 0, file->length, (void*)module_load_address);
 
 	/**
-	 * Locate the section string table, which we'll use for debugging and to check
-	 * for special section names (eg. dependencies, PCI mappings...)
-	 */
-	#if 0
-	Elf64_Shdr * shstr_hdr = (Elf64_Shdr*)(module_load_address + header.e_shoff + header.e_shentsize * header.e_shstrndx);
-	char * stringTable = (char*)(module_load_address + shstr_hdr->sh_offset);
-	#endif
-
-	/**
 	 * Set up section header entries to have correct loaded addresses, and map
 	 * any NOBITS sections to new memory. We'll page-align anything, which
 	 * should be good enough for any object files we make...
@@ -99,6 +106,11 @@ int elf_module(char ** args) {
 			memset((void*)sectionHeader->sh_addr, 0, sectionHeader->sh_size);
 		} else {
 			sectionHeader->sh_addr = (uintptr_t)(module_load_address + sectionHeader->sh_offset);
+			if (sectionHeader->sh_addralign &&
+				(sectionHeader->sh_addr & (sectionHeader->sh_addralign -1))) {
+				dprintf("mod: probably not aligned correctly: %#zx %ld\n",
+					sectionHeader->sh_addr, sectionHeader->sh_addralign);
+			}
 		}
 	}
 
@@ -116,11 +128,10 @@ int elf_module(char ** args) {
 		/* Uh, we should be able to figure out how many symbols we have by doing something less dumb than
 		 * just checking the size of the section, right? */
 		for (unsigned int sym = 0; sym < sectionHeader->sh_size / sizeof(Elf64_Sym); ++sym) {
-			/* TODO: We need to share symbols... */
-			#if 0
-			int binding = (symTable[sym].st_info >> 4);
-			int type = (symTable[sym].st_info & 0xF);
-			#endif
+			/* Unlike the previous implementation of this module loader in toaru32,
+			 * we specifically do not support binding symbols directly from newly
+			 * loaded modules. If a module wants to expose symbols, it should use
+			 * @c ksym_bind to supply new symbol names to the symbol table. */
 
 			if (symTable[sym].st_shndx > 0 && symTable[sym].st_shndx < SHN_LOPROC) {
 				Elf64_Shdr * sh_hdr = (Elf64_Shdr*)(module_load_address + header.e_shoff + header.e_shentsize * symTable[sym].st_shndx);
@@ -153,24 +164,58 @@ int elf_module(char ** args) {
 		Elf64_Shdr * symbolSection = (Elf64_Shdr*)(module_load_address + header.e_shoff + header.e_shentsize * sectionHeader->sh_link);
 		Elf64_Sym * symbolTable = (Elf64_Sym *)symbolSection->sh_addr;
 
+#define S (symbolTable[ELF64_R_SYM(table[rela].r_info)].st_value)
+#define A (table[rela].r_addend)
+#define T32 (*(uint32_t*)target)
+#define T64 (*(uint64_t*)target)
+#define P  (target)
+
 		for (unsigned int rela = 0; rela < sectionHeader->sh_size / sizeof(Elf64_Rela); ++rela) {
 			uintptr_t target = table[rela].r_offset + targetSection->sh_addr;
 			switch (ELF64_R_TYPE(table[rela].r_info)) {
+#if defined(__x86_64__)
 				case R_X86_64_64:
-					*(uint64_t*)target = symbolTable[ELF64_R_SYM(table[rela].r_info)].st_value + table[rela].r_addend;
+					T64 = S + A;
 					break;
 				case R_X86_64_32:
-					*(uint32_t*)target = symbolTable[ELF64_R_SYM(table[rela].r_info)].st_value + table[rela].r_addend;
+					T32 = S + A;
 					break;
 				case R_X86_64_PC32:
-					*(uint32_t*)target = symbolTable[ELF64_R_SYM(table[rela].r_info)].st_value + table[rela].r_addend - target;
+					T32 = S + A - P;
 					break;
+#elif defined(__aarch64__)
+				case 275: { /* R_AARCH64_ADR_PREL_PG_HI21 */
+					T32 = T32 | aarch64_imm_adr( ((S + A) >> 12) - (P >> 12) );
+					break;
+				}
+				case 286: /* R_AARCH64_LDST64_ABS_LO12_NC */
+					T32 = T32 | aarch64_imm_12( ((S + A) >> 3) & 0x1FF );
+					break;
+				case 282: /* R_AARCH64_JUMP26 */
+				case 283: /* R_AARCH64_CALL26 */
+					T32 = T32 | (((S + A - P) >> 2) & 0x3ffffff);
+					break;
+				case 257: /* ABS64 */
+					T64 = S + A;
+					break;
+				case 258: /* ABS32 */
+					T32 = S + A;
+					break;
+#endif
 				default:
+					dprintf("mod: unsupported relocation %ld found\n", ELF64_R_TYPE(table[rela].r_info));
 					error = EINVAL;
-					goto _unmap_module;
 			}
 		}
 	}
+
+#undef S
+#undef A
+#undef T32
+#undef T64
+#undef P
+
+	if (error) goto _unmap_module;
 
 	if (hashmap_has(_modules_table, moduleData->name)) {
 		error = EEXIST;
@@ -229,7 +274,7 @@ int elf_exec(const char * path, fs_node_t * file, int argc, const char *const ar
 		return -EINVAL;
 	}
 
-	if (file->mask & 0x800) {
+	if ((file->mask & S_ISUID) && !(this_core->current_process->flags & (PROC_FLAG_TRACE_SYSCALLS | PROC_FLAG_TRACE_SIGNALS))) {
 		/* setuid */
 		this_core->current_process->user = file->uid;
 	}
@@ -267,6 +312,12 @@ int elf_exec(const char * path, fs_node_t * file, int argc, const char *const ar
 	this_core->current_process->thread.page_directory->directory = mmu_clone(NULL);
 	mmu_set_directory(this_core->current_process->thread.page_directory->directory);
 	process_release_directory(this_directory);
+	for (int i = 0; i < NUMSIGNALS; ++i) {
+		if (this_core->current_process->signals[i].handler != 1) {
+			this_core->current_process->signals[i].handler = 0;
+			this_core->current_process->signals[i].flags = 0;
+		}
+	}
 
 	for (int i = 0; i < header.e_phnum; ++i) {
 		Elf64_Phdr phdr;

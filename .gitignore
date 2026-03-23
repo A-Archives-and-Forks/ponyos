@@ -23,9 +23,12 @@
 /util/local
 /util/cross
 /base/bin/*
+/base/etc/issue
+/base/etc/os-release
 /base/usr/bin/*
 /base/usr/lib/*
 /base/lib/kuroko/*
+/base/usr/share/games/doom
 /.make/
 /cdrom
 /fatbase
@@ -36,3 +39,4 @@
 /kernel8.img
 /kernel8.img.elf
 /base/usr/share/fonts/truetype/equestria/*
+/base/usr/share/bim/*

@@ -130,7 +130,7 @@ static struct dirent * readdir_mapper(fs_node_t *node, unsigned long index) {
 static fs_node_t * vfs_mapper(void) {
 	fs_node_t * fnode = malloc(sizeof(fs_node_t));
 	memset(fnode, 0x00, sizeof(fs_node_t));
-	fnode->mask = 0555;
+	fnode->mask    = 0555;
 	fnode->flags   = FS_DIRECTORY;
 	fnode->readdir = readdir_mapper;
 	fnode->ctime   = now();
@@ -179,6 +179,7 @@ ssize_t read_fs(fs_node_t *node, off_t offset, size_t size, uint8_t *buffer) {
 	if (node->read) {
 		return node->read(node, offset, size, buffer);
 	} else {
+		if (node->flags & FS_DIRECTORY) return -EISDIR;
 		return -EINVAL;
 	}
 }
@@ -197,6 +198,7 @@ ssize_t write_fs(fs_node_t *node, off_t offset, size_t size, uint8_t *buffer) {
 	if (node->write) {
 		return node->write(node, offset, size, buffer);
 	} else {
+		if (node->flags & FS_DIRECTORY) return -EISDIR;
 		return -EROFS;
 	}
 }
@@ -206,11 +208,11 @@ ssize_t write_fs(fs_node_t *node, off_t offset, size_t size, uint8_t *buffer) {
  *
  * @param node File to resize
  */
-int truncate_fs(fs_node_t * node) {
+int truncate_fs(fs_node_t * node, size_t size) {
 	if (!node) return -ENOENT;
 
 	if (node->truncate) {
-		return node->truncate(node);
+		return node->truncate(node, size);
 	}
 
 	return -EINVAL;
@@ -352,6 +354,65 @@ int ioctl_fs(fs_node_t *node, unsigned long request, void * argp) {
 	}
 }
 
+fs_node_t * file_get_parent(const char * path) {
+	char * parent_path = malloc(strlen(path) + 5);
+	snprintf(parent_path, strlen(path) + 4, "%s/..", path);
+	fs_node_t * parent  = kopen(parent_path, 0);
+	free(parent_path);
+	return parent;
+}
+
+static const char * fs_basename(const char * path) {
+	const char * f_path = path + strlen(path) - 1;
+	while (f_path > path && *f_path == '/') {
+		/* Trailing slashes */
+		f_path--;
+	}
+	while (f_path > path) {
+		if (*f_path == '/') {
+			f_path += 1;
+			break;
+		}
+		f_path--;
+	}
+
+	while (*f_path == '/') {
+		f_path++;
+	}
+
+	return f_path;
+}
+
+int rename_file_fs(const char * src, const char * dest) {
+	if (!*src || !*dest) return -ENOENT;
+	fs_node_t * src_parent = file_get_parent(src);
+	if (!src_parent) return -ENOENT;
+	fs_node_t * dest_parent = file_get_parent(dest);
+	if (!dest_parent) { close_fs(src_parent); return -ENOENT; }
+
+	int out = 0;
+	if (!src_parent->mount) { out = -EROFS; goto _nope; }
+	if (src_parent->mount != dest_parent->mount) { out = -EXDEV; goto _nope; }
+	if (!src_parent->mount->rename) { out = -ENOTSUP; goto _nope; }
+
+	if (!has_permission(src_parent, 02) || !has_permission(src_parent, 01)) { out = -EACCES; goto _nope; }
+	if (!has_permission(dest_parent, 02) || !has_permission(dest_parent, 01)) { out = -EACCES; goto _nope; }
+
+	/* Get basename of each path component */
+	const char * src_name = fs_basename(src);
+	const char * dest_name = fs_basename(dest);
+
+	if (!*src_name || !*dest_name) return -EINVAL;
+	if (*src_name == '/' || *dest_name == '/') return -EINVAL;
+
+	out = src_parent->mount->rename(src_parent->mount, src_parent, src_name, dest_parent, dest_name);
+
+_nope:
+	close_fs(dest_parent);
+	close_fs(src_parent);
+	return out;
+}
+
 
 /*
  * XXX: The following two function should be replaced with
@@ -392,8 +453,10 @@ int create_file_fs(char *name, mode_t permission) {
 		return -ENOENT;
 	}
 
-	if (!has_permission(parent, 02)) {
-		debug_print(WARNING, "bad permissions");
+	/* Need both exec and write on the parent to create a new entry */
+	if (!has_permission(parent, 02) || !has_permission(parent, 01)) {
+		free(path);
+		close_fs(parent);
 		return -EACCES;
 	}
 
@@ -441,7 +504,7 @@ int unlink_fs(char * name) {
 		return -ENOENT;
 	}
 
-	if (!has_permission(parent, 02)) {
+	if (!has_permission(parent, 02) || !has_permission(parent, 01)) {
 		free(path);
 		close_fs(parent);
 		return -EACCES;
@@ -499,18 +562,7 @@ int mkdir_fs(char *name, mode_t permission) {
 		return -EEXIST;
 	}
 
-	fs_node_t * this = kopen(path, 0);
-	int _exists = 0;
-	if (this) { /* We need to do this because permission check stuff... */
-		close_fs(this);
-		_exists = 1;
-	}
-
-	if (!has_permission(parent, 02)) {
-		free(path);
-		close_fs(parent);
-		return _exists ? -EEXIST : -EACCES;
-	}
+	/* Permission check was moved into methods for reasons. */
 
 	int ret = 0;
 	if (parent->mkdir) {
@@ -562,6 +614,13 @@ int symlink_fs(char * target, char * name) {
 	if (!parent) {
 		free(path);
 		return -ENOENT;
+	}
+
+	/* Need both exec and write on the parent to create a new entry */
+	if (!has_permission(parent, 02) || !has_permission(parent, 01)) {
+		free(path);
+		close_fs(parent);
+		return -EACCES;
 	}
 
 	int ret = 0;
@@ -742,12 +801,8 @@ int vfs_mount_type(const char * type, const char * arg, const char * mountpoint)
 
 	if (!n) return -EINVAL;
 
-	tree_node_t * node = vfs_mount(mountpoint, n);
-	if (node && node->value) {
-		struct vfs_entry * ent = (struct vfs_entry *)node->value;
-		ent->fs_type = strdup(type);
-		ent->device  = strdup(arg);
-	}
+	tree_node_t * node = vfs_mount(mountpoint, n, type, arg);
+	if (!node) return -EINVAL;
 
 	debug_print(NOTICE, "Mounted %s[%s] to %s: %p", type, arg, mountpoint, (void*)n);
 	debug_print_vfs_tree();
@@ -768,7 +823,7 @@ static spin_lock_t tmp_vfs_lock = { 0 };
  *
  * Paths here must be absolute.
  */
-void * vfs_mount(const char * path, fs_node_t * local_root) {
+void * vfs_mount(const char * path, fs_node_t * local_root, const char * type, const char * options) {
 	if (!fs_tree) {
 		debug_print(ERROR, "VFS hasn't been initialized, you can't mount things yet!");
 		return NULL;
@@ -810,6 +865,8 @@ void * vfs_mount(const char * path, fs_node_t * local_root) {
 			debug_print(WARNING, "Path %s already mounted, unmount before trying to mount something else.", path);
 		}
 		root->file = local_root;
+		root->device = strdup(options);
+		root->fs_type = strdup(type);
 		/* We also keep a legacy shortcut around for that */
 		fs_root = local_root;
 		ret_val = root_node;
@@ -848,6 +905,8 @@ void * vfs_mount(const char * path, fs_node_t * local_root) {
 			debug_print(WARNING, "Path %s already mounted, unmount before trying to mount something else.", path);
 		}
 		ent->file = local_root;
+		ent->device = strdup(options);
+		ent->fs_type = strdup(type);
 		ret_val = node;
 	}
 
@@ -858,7 +917,7 @@ void * vfs_mount(const char * path, fs_node_t * local_root) {
 
 void map_vfs_directory(const char * c) {
 	fs_node_t * f = vfs_mapper();
-	struct vfs_entry * e = vfs_mount((char*)c, f);
+	tree_node_t * e = vfs_mount((char*)c, f, "vfs_mapper", "");
 	if (!strcmp(c, "/")) {
 		f->device = fs_tree->root;
 	} else {
@@ -1095,6 +1154,15 @@ fs_node_t *kopen_recur(const char *filename, uint64_t flags, uint64_t symlink_de
 			return node_ptr;
 		}
 		/* We are still searching... */
+		if (!has_permission(node_ptr, 01)) {
+			/*
+			 * TODO: kopen_recur has no way to pass along a failure reason?
+			 *       This will appear as 'ENOENT' instead of 'EACCESS', should fix that...
+			 */
+			free(node_ptr);
+			free((void*)path);
+			return NULL;
+		}
 		debug_print(INFO, "... Searching for %s", path_offset);
 		fs_node_t * node_next = finddir_fs(node_ptr, path_offset);
 		free(node_ptr); /* Always a clone or an unopened thing */

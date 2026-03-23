@@ -30,11 +30,13 @@
  */
 void arch_enter_user(uintptr_t entrypoint, int argc, char * argv[], char * envp[], uintptr_t stack) {
 	struct regs ret;
-	ret.cs = 0x18 | 0x03;
+	ret.cs = 0x28 | 0x03;
 	ret.ss = 0x20 | 0x03;
 	ret.rip = entrypoint;
 	ret.rflags = (1 << 21) | (1 << 9);
 	ret.rsp = stack;
+
+	update_process_times_on_exit();
 
 	asm volatile (
 		"pushq %0\n"
@@ -68,13 +70,17 @@ static void _kill_it(void) {
 	stack += sizeof(type); \
 } while (0)
 
-void arch_return_from_signal_handler(struct regs *r) {
+int arch_return_from_signal_handler(struct regs *r) {
 
 	for (int i = 0; i < 64; ++i) {
 		POP(r->rsp, uint64_t, this_core->current_process->thread.fp_regs[63-i]);
 	}
 
 	arch_restore_floating((process_t*)this_core->current_process);
+
+	POP(r->rsp, sigset_t, this_core->current_process->blocked_signals);
+	long originalSignal;
+	POP(r->rsp, long, originalSignal);
 
 	POP(r->rsp, long, this_core->current_process->interrupted_system_call);
 
@@ -91,6 +97,7 @@ void arch_return_from_signal_handler(struct regs *r) {
 	R(rsp);
 
 	r->rflags = (out.rflags & 0xcd5) | (1 << 21) | (1 << 9) | ((r->rflags & (1 << 8)) ? (1 << 8) : 0);
+	return originalSignal;
 }
 
 
@@ -109,7 +116,7 @@ void arch_return_from_signal_handler(struct regs *r) {
  */
 void arch_enter_signal_handler(uintptr_t entrypoint, int signum, struct regs *r) {
 	struct regs ret;
-	ret.cs = 0x18 | 0x03;
+	ret.cs = 0x28 | 0x03;
 	ret.ss = 0x20 | 0x03;
 	ret.rip = entrypoint;
 	ret.rflags = (1 << 21) | (1 << 9);
@@ -120,12 +127,20 @@ void arch_enter_signal_handler(uintptr_t entrypoint, int signum, struct regs *r)
 	PUSH(ret.rsp, long, this_core->current_process->interrupted_system_call);
 	this_core->current_process->interrupted_system_call = 0;
 
+	PUSH(ret.rsp, long, signum);
+	PUSH(ret.rsp, sigset_t, this_core->current_process->blocked_signals);
+
+	struct signal_config * config = (struct signal_config*)&this_core->current_process->signals[signum];
+	this_core->current_process->blocked_signals |= config->mask | (config->flags & SA_NODEFER ? 0 : (1UL << signum));
+
 	arch_save_floating((process_t*)this_core->current_process);
 	for (int i = 0; i < 64; ++i) {
 		PUSH(ret.rsp, uint64_t, this_core->current_process->thread.fp_regs[i]);
 	}
 
-	PUSH(ret.rsp, uintptr_t, 0x00000008DEADBEEF);
+	PUSH(ret.rsp, uintptr_t, 0x516);
+
+	update_process_times_on_exit();
 
 	asm volatile(
 		"pushq %0\n"
@@ -266,10 +281,10 @@ long arch_reboot(void) {
 /* Syscall parameter accessors */
 void arch_syscall_return(struct regs * r, long retval) { r->rax = retval; }
 long arch_syscall_number(struct regs * r) { return (unsigned long)r->rax; }
-long arch_syscall_arg0(struct regs * r) { return r->rbx; }
-long arch_syscall_arg1(struct regs * r) { return r->rcx; }
+long arch_syscall_arg0(struct regs * r) { return r->rdi; }
+long arch_syscall_arg1(struct regs * r) { return r->rsi; }
 long arch_syscall_arg2(struct regs * r) { return r->rdx; }
-long arch_syscall_arg3(struct regs * r) { return r->rsi; }
-long arch_syscall_arg4(struct regs * r) { return r->rdi; }
+long arch_syscall_arg3(struct regs * r) { return r->r10; }
+long arch_syscall_arg4(struct regs * r) { return r->r8; }
 long arch_stack_pointer(struct regs * r) { return r->rsp; }
 long arch_user_ip(struct regs * r) { return r->rip; }

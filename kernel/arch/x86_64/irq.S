@@ -54,11 +54,11 @@ ISR_ERR   13
 ISR_ERR   14
 ISR_NOERR 15
 ISR_NOERR 16
-ISR_NOERR 17
+ISR_ERR   17
 ISR_NOERR 18
 ISR_NOERR 19
 ISR_NOERR 20
-ISR_NOERR 21
+ISR_ERR   21
 ISR_NOERR 22
 ISR_NOERR 23
 ISR_NOERR 24
@@ -66,8 +66,8 @@ ISR_NOERR 25
 ISR_NOERR 26
 ISR_NOERR 27
 ISR_NOERR 28
-ISR_NOERR 29
-ISR_NOERR 30
+ISR_ERR   29
+ISR_ERR   30
 ISR_NOERR 31
 IRQ 0, 32
 IRQ 1, 33
@@ -94,20 +94,14 @@ ISR_NOERR 127
 _isr123:
     /* Acknowledge IPI */
     pushq %r12
-    mov (lapic_final), %r12
+    mov (lapic_final)(%rip), %r12
     add $0xb0, %r12
     movl $0, (%r12)
     popq %r12
-    /* Are we in userspace? */
-    cmpq $8, 8(%rsp)
-    je 1f
     /* Then we can proceed! */
     pushq $0x00
     pushq $123
     jmp isr_common
-1:
-    /* If we were not in userspace, nothing to do; we were already idle. */
-    iretq
 
 
 .global _isr124
@@ -116,7 +110,7 @@ _isr124:
     pushq %r12
     mov %cr3, %r12
     mov %r12, %cr3
-    mov (lapic_final), %r12
+    mov (lapic_final)(%rip), %r12
     add $0xb0, %r12
     movl $0, (%r12)
     popq %r12
@@ -128,7 +122,7 @@ _isr124:
 .type _isr126, @function
 _isr126:
     pushq %r12
-    mov (lapic_final), %r12
+    mov (lapic_final)(%rip), %r12
     add $0xb0, %r12
     movl $0, (%r12)
     popq %r12
@@ -187,7 +181,6 @@ isr_common:
     /* Call interrupt handler */
     mov %rsp, %rdi
     call isr_handler
-    mov %rax, %rsp
 
     /* Restore all registers */
     pop %r15
@@ -263,3 +256,67 @@ arch_enter_tasklet:
     popq %rdi
     popq %rsi
     jmpq *%rsi
+
+
+.extern syscall_centry
+.global syscall_entry
+.type syscall_entry, @function
+syscall_entry:
+    swapgs             /* SYSCALL only happens from userspace, so we must always swap gs */
+    mov %rsp, %gs:0x78 /* Store user RSP temporarily */
+    mov %gs:0x70, %rsp /* Restore kernel stack for this thread */
+
+    /* Normal `struct regs` layout, same as what we'd get on an interrupt */
+    pushq $0x23        /* SS */
+    pushq %gs:0x78     /* RSP */
+    push %r11          /* RFLAGS - SYSCALL stores in r11 */
+    pushq $0x2b        /* CS */
+    push %rcx          /* RIP - SYSCALL stores in rcx */
+
+    pushq $0           /* Dummy error code */
+    pushq $0           /* Dummy interrupt number */
+
+    push %rax
+    push %rbx
+    pushq $0           /* rcx is not valid, set to zero */
+    push %rdx
+    push %rsi
+    push %rdi
+    push %rbp
+    push %r8
+    push %r9
+    push %r10
+    pushq $0           /* r11 is not valid, set to zero */
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+
+    mov %rsp, %rdi
+    call syscall_centry
+
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    add $8, %rsp
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rbp
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    add $8, %rsp
+    pop %rbx
+    pop %rax
+
+    add $16, %rsp
+
+    pop %rcx
+    add $8, %rsp
+    pop %r11
+    pop %rsp
+
+    swapgs
+    sysretq

@@ -75,7 +75,7 @@ mb2_tag_entry:
 .word 3
 .word 0
 .long 12
-.long start
+.long start_mbi2
 
 /* Framebuffer tag */
 .align 8
@@ -89,7 +89,7 @@ mb2_tag_fb:
 
 .align 8
 .word 4
-.word 0
+.word 1
 .long 12
 .long 2 /* We support EGA text, but don't require it */
 
@@ -98,6 +98,16 @@ mb2_tag_fb:
 .word 6
 .word 0
 .long 8
+
+/* Relocatable tag */
+.align 8
+.word 10
+.word 0
+.long 24
+.long 0x100000  /* Start */
+.long 0x1000000 /* Maximum load address */
+.long 4096      /* Request page alignment */
+.long 1         /* Load at lowest available */
 
 /* End tag */
 .align 8
@@ -124,12 +134,34 @@ stack_top:
 .extern kmain
 .type kmain, @function
 
+.global start_mbi2
+.type start_mbi2, @function
+
+start_mbi2:
+    /* Use reserved 0 space of boot information struct to thunk eip */
+    movl %ebx, %ecx
+    addl $8, %ecx
+    jmp good_to_go
+
 .global start
 .type start, @function
 
 start:
+    /* Use boot_drive as a temporary place to thunk eip */
+    movl %ebx, %ecx
+    addl $16, %ecx
+
+good_to_go:
+    mov  %ecx, %esp
+
+    call _forward
+_forward:
+    popl %ecx
+    subl $_forward, %ecx
+
     /* Setup our stack */
     mov $stack_top, %esp
+    addl %ecx, %esp
 
     /* Make sure our stack is 16-byte aligned */
     and $-16, %esp
@@ -151,7 +183,8 @@ jmp_to_long:
 
     /* Set up initial page region, which was zero'd for us by the loader */
     mov $init_page_region, %edi
-    mov %edi, %cr3
+    addl %ecx, %edi
+    pushl %ecx
 
     /* PML4[0] = &PDP[0] | (PRESENT, WRITABLE, USER) */
     mov $0x1007, %eax
@@ -179,6 +212,12 @@ jmp_to_long:
     add $8, %edi
     loop .set_entry
 
+    mov $init_page_region, %edi
+    popl %ecx
+    addl %ecx, %edi
+    pushl %ecx
+    mov %edi, %cr3
+
     /* Enable PAE */
     mov %cr4, %eax
     or $32, %eax
@@ -190,12 +229,42 @@ jmp_to_long:
     or $256, %eax
     wrmsr
 
-    /* Set PG */
+    /* Check PG */
     mov %cr0, %eax
+
+    /* If paging was enabled, assume we were already in long mode (eg. booted by EFI) */
+    test $0x80000000, %eax
+    jnz .continue
+
+    /* Otherwise enable paging */
     or $0x80000000, %eax
     mov %eax, %cr0
 
+super_duper_bullshit:
+    popl %ecx
+
+    lea (_lgdt_instr+3)(%ecx), %eax
+    movl (%eax), %ebx
+    addl %ecx, %ebx
+    movl %ebx, (%eax)
+
+    lea (gdtr+2)(%ecx), %eax
+    movl (%eax), %ebx
+    addl %ecx, %ebx
+    movl %ebx, (%eax)
+
+    lea (_ljmp_instr+1)(%ecx), %eax
+    movl (%eax), %ebx
+    addl %ecx, %ebx
+    movl %ebx, (%eax)
+
+    pushl $0
+    pushl %ecx
+
+_lgdt_instr:
     lgdt gdtr
+
+_ljmp_instr:
     ljmp $0x08,$realm64
 
 .align 8
@@ -236,6 +305,9 @@ realm64:
     mov %ax, %gs
     mov %ax, %ss
 
+.continue:
+    cli
+    pop %rcx
     pop %rdi
     pop %rsi
     pop %rdx

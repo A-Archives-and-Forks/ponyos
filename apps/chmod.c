@@ -10,9 +10,12 @@
  * of the NCSA / University of Illinois License - see LICENSE.md
  * Copyright (C) 2018 K. Lange
  */
+#include <ctype.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <string.h>
 #include <sys/stat.h>
 
 enum mode_set {
@@ -50,8 +53,7 @@ int main(int argc, char * argv[]) {
 
 	while (*c) {
 		switch (*c) {
-			case '0':
-				c++; /* 0 */
+			case '0' ... '7':
 				while (*c >= '0' && *c <= '7') {
 					mode *= 8;
 					mode += (*c - '0');
@@ -102,15 +104,20 @@ int main(int argc, char * argv[]) {
 				mode |= calc(S_IXOTH, user_modes | all_users);
 				c++;
 				break;
+			default:
+				fprintf(stderr, "%s: invalid mode '%s'\n", argv[0], argv[1]);
+				return 1;
 		}
 	}
 
-	int i = 2;
-	while (i < argc) {
+	int out = 0;
+	for (int i = 2; i < argc; ++i) {
 		int actual_mode = 0;
 		struct stat _stat;
 		if (stat(argv[i], &_stat) < 0) {
-			fprintf(stderr, "%s: %s: error with stat\n", argv[0], argv[i]);
+			fprintf(stderr, "%s: %s: %s\n", argv[0], argv[i], strerror(errno));
+			out |= 1;
+			continue;
 		}
 
 		switch (mode_set) {
@@ -118,19 +125,19 @@ int main(int argc, char * argv[]) {
 				actual_mode = mode;
 				break;
 			case MODE_ADD:
-				actual_mode = _stat.st_mode | mode;
+				actual_mode = (_stat.st_mode & 07777) | mode;
 				break;
 			case MODE_REMOVE:
-				actual_mode = _stat.st_mode &= ~(mode);
+				actual_mode = (_stat.st_mode & 07777) & ~(mode);
 				break;
 		}
 
 		if (chmod(argv[i], actual_mode) < 0) {
-			fprintf(stderr, "%s: %s: error with chmod\n", argv[0], argv[i]);
-			return 1;
+			fprintf(stderr, "%s: %s: %s\n", argv[0], argv[i], strerror(errno));
+			out |= 1;
+			continue;
 		}
-		i++;
 	}
 
-	return 0;
+	return out;
 }

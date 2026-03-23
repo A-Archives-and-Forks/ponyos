@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <syscall.h>
 #include <string.h>
 #include <sys/types.h>
@@ -14,7 +15,6 @@ struct _FILE {
 	int offset;
 	int read_from;
 	int ungetc;
-	int eof;
 	int bufsiz;
 	long last_read_start;
 	char * _name;
@@ -25,7 +25,14 @@ struct _FILE {
 
 	struct _FILE * prev;
 	struct _FILE * next;
+
+	int flags;
 };
+
+/* Flag values */
+#define STDIO_EOF         0x0001
+#define STDIO_ERROR       0x0002
+#define STDIO_UNSEEKABLE  0x0004
 
 FILE _stdin = {
 	.fd = 0,
@@ -34,13 +41,13 @@ FILE _stdin = {
 	.offset = 0,
 	.read_from = 0,
 	.ungetc = -1,
-	.eof = 0,
 	.last_read_start = 0,
 	.bufsiz = BUFSIZ,
 
 	.wbufsiz = BUFSIZ,
 	.write_buf = NULL,
 	.written = 0,
+	.flags = 0,
 };
 
 FILE _stdout = {
@@ -50,13 +57,13 @@ FILE _stdout = {
 	.offset = 0,
 	.read_from = 0,
 	.ungetc = -1,
-	.eof = 0,
 	.last_read_start = 0,
 	.bufsiz = BUFSIZ,
 
 	.wbufsiz = BUFSIZ,
 	.write_buf = NULL,
 	.written = 0,
+	.flags = 0,
 };
 
 FILE _stderr = {
@@ -66,13 +73,13 @@ FILE _stderr = {
 	.offset = 0,
 	.read_from = 0,
 	.ungetc = -1,
-	.eof = 0,
 	.last_read_start = 0,
 	.bufsiz = BUFSIZ,
 
 	.wbufsiz = BUFSIZ,
 	.write_buf = NULL,
 	.written = 0,
+	.flags = 0,
 };
 
 FILE * stdin = &_stdin;
@@ -129,7 +136,11 @@ int setvbuf(FILE * stream, char * buf, int mode, size_t size) {
 int fflush(FILE * stream) {
 	if (!stream->write_buf) return EOF;
 	if (stream->written) {
-		syscall_write(stream->fd, stream->write_buf, stream->written);
+		ssize_t written = syscall_write(stream->fd, stream->write_buf, stream->written);
+		if (written < 0) {
+			stream->flags |= STDIO_ERROR;
+			return EOF;
+		}
 		stream->written = 0;
 	}
 	return 0;
@@ -142,7 +153,7 @@ static size_t write_bytes(FILE * f, char * buf, size_t len) {
 	while (len > 0) {
 		f->write_buf[f->written++] = *buf;
 		if (f->written == (size_t)f->wbufsiz || *buf == '\n') {
-			fflush(f);
+			if (fflush(f) == EOF) return newBytes;
 		}
 		newBytes++;
 		buf++;
@@ -172,10 +183,17 @@ static size_t read_bytes(FILE * f, char * out, size_t len) {
 			if (f->offset == f->bufsiz) {
 				f->offset = 0;
 			}
-			f->last_read_start = syscall_seek(f->fd, 0, SEEK_CUR);
+			if (!(f->flags & STDIO_UNSEEKABLE)) {
+				f->last_read_start = syscall_seek(f->fd, 0, SEEK_CUR);
+				if (f->last_read_start == -ESPIPE) {
+					f->last_read_start = -1;
+					f->flags |= STDIO_UNSEEKABLE;
+				}
+			}
 			ssize_t r = read(fileno(f), &f->read_buf[f->offset], f->bufsiz - f->offset);
 			if (r < 0) {
 				//fprintf(stderr, "error condition\n");
+				f->flags |= STDIO_ERROR;
 				return r_out;
 			} else {
 				f->read_from = f->offset;
@@ -187,7 +205,7 @@ static size_t read_bytes(FILE * f, char * out, size_t len) {
 		if (f->available == 0) {
 			/* EOF condition */
 			//fprintf(stderr, "%s: no bytes available, returning read value of %d\n", _argv_0, r_out);
-			f->eof = 1;
+			f->flags |= STDIO_EOF;
 			return r_out;
 		}
 
@@ -228,6 +246,9 @@ static void parse_mode(const char * mode, int * flags_, int * mask_) {
 			flags |= O_RDWR;
 			flags &= ~(O_APPEND); /* uh... */
 		}
+		if (*x == 'x') {
+			flags |= O_EXCL;
+		}
 		++x;
 	}
 
@@ -256,7 +277,7 @@ FILE * fopen(const char *path, const char *mode) {
 	out->read_from = 0;
 	out->offset = 0;
 	out->ungetc = -1;
-	out->eof = 0;
+	out->flags = 0;
 	out->_name = strdup(path);
 
 	out->write_buf = malloc(BUFSIZ);
@@ -275,6 +296,7 @@ FILE * freopen(const char *path, const char *mode, FILE * stream) {
 
 	if (path) {
 		fflush(stream);
+		free(stream->_name);
 		syscall_close(stream->fd);
 		int flags, mask;
 		parse_mode(mode, &flags, &mask);
@@ -284,14 +306,9 @@ FILE * freopen(const char *path, const char *mode, FILE * stream) {
 		stream->read_from = 0;
 		stream->offset = 0;
 		stream->ungetc = -1;
-		stream->eof = 0;
+		stream->flags = 0;
 		stream->_name = strdup(path);
 		stream->written = 0;
-		if (stream != &_stdin && stream != &_stdout && stream != &_stderr) {
-			stream->next = _head;
-			if (_head) _head->prev = stream;
-			_head = stream;
-		}
 		if (fd < 0) {
 			errno = -fd;
 			return NULL;
@@ -318,7 +335,7 @@ FILE * fdopen(int fd, const char *mode){
 	out->read_from = 0;
 	out->offset = 0;
 	out->ungetc = -1;
-	out->eof = 0;
+	out->flags = 0;
 
 	char tmp[30];
 	sprintf(tmp, "fd[%d]", fd);
@@ -385,7 +402,7 @@ int fseek(FILE * stream, long offset, int whence) {
 	stream->read_from = 0;
 	stream->available = 0;
 	stream->ungetc = -1;
-	stream->eof = 0;
+	stream->flags = 0;
 
 	int resp = syscall_seek(stream->fd,offset,whence);
 	if (resp < 0) {
@@ -409,7 +426,7 @@ long ftell(FILE * stream) {
 	stream->read_from = 0;
 	stream->available = 0;
 	stream->ungetc = -1;
-	stream->eof = 0;
+	stream->flags = 0;
 	long resp = syscall_seek(stream->fd, 0, SEEK_CUR);
 	if (resp < 0) {
 		errno = -resp;
@@ -433,12 +450,9 @@ int fsetpos(FILE *stream, const fpos_t *pos) {
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE * stream) {
 	char * tracking = (char*)ptr;
 	for (size_t i = 0; i < nmemb; ++i) {
-		int r = read_bytes(stream, tracking, size);
-		if (r < 0) {
-			return -1;
-		}
+		size_t r = read_bytes(stream, tracking, size);
 		tracking += r;
-		if (r < (int)size) {
+		if (r < size) {
 			return i;
 		}
 	}
@@ -448,12 +462,9 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE * stream) {
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE * stream) {
 	char * tracking = (char*)ptr;
 	for (size_t i = 0; i < nmemb; ++i) {
-		int r = write_bytes(stream, tracking, size);
-		if (r < 0) {
-			return -1;
-		}
+		size_t r = write_bytes(stream, tracking, size);
 		tracking += r;
-		if (r < (int)size) {
+		if (r < size) {
 			return i;
 		}
 	}
@@ -484,10 +495,10 @@ int fgetc(FILE * stream) {
 	int r;
 	r = fread(buf, 1, 1, stream);
 	if (r < 0) {
-		stream->eof = 1;
+		stream->flags |= STDIO_EOF;
 		return EOF;
 	} else if (r == 0) {
-		stream->eof = 1;
+		stream->flags |= STDIO_EOF;
 		return EOF;
 	}
 	return (unsigned char)buf[0];
@@ -500,24 +511,24 @@ int getchar(void) {
 }
 
 char *fgets(char *s, int size, FILE *stream) {
+	if (size == 0) return NULL;
+	if (size == 1) return *s = '\0', s;
 	int c;
 	char * out = s;
-	while ((c = fgetc(stream)) > 0) {
+	while ((c = fgetc(stream)) >= 0) {
 		*s++ = c;
 		size--;
-		if (size == 0) {
-			return out;
-		}
 		*s = '\0';
-		if (c == '\n') {
+		if (size == 1 || c == '\n') {
 			return out;
 		}
 	}
 	if (c == EOF) {
-		stream->eof = 1;
+		stream->flags |= STDIO_EOF;
 		if (out == s) {
 			return NULL;
 		} else {
+			*s = '\0';
 			return out;
 		}
 	}
@@ -537,13 +548,60 @@ void setbuf(FILE * stream, char * buf) {
 }
 
 int feof(FILE * stream) {
-	return stream->eof;
+	return !!(stream->flags & STDIO_EOF);
 }
 
 void clearerr(FILE * stream) {
-	stream->eof = 0;
+	stream->flags = ~(STDIO_ERROR | STDIO_EOF);
 }
 
 int ferror(FILE * stream) {
-	return 0; /* TODO */
+	return !!(stream->flags & STDIO_ERROR);
+}
+
+ssize_t getdelim(char **restrict lineptr, size_t *restrict n, int delimiter, FILE *restrict stream) {
+	if (!lineptr || !n) {
+		errno = EINVAL;
+		/* XXX Are we supposed to set the stream to failed for this case? Seems dubious. */
+		return -1;
+	}
+
+	size_t c = 0;
+	while (1) {
+		int i = fgetc(stream);
+
+		if (*n <= c + 1) {
+			size_t nn = *n < 120 ? 120 : (*n * 2);
+			/* TODO: We don't define SSIZE_MAX? Anyway, ssize_t is typedefed to long on all both of our supported
+			 * platforms, so use LONG_MAX here as a replacement. size_t should be able to hold SSIZE_MAX * 2, so
+			 * the above calculation should not overflow and we can check here if *n has gotten too big. */
+			if (nn > LONG_MAX) nn = LONG_MAX;
+			if (nn <= c + 1) {
+				/* ... and this check should only trip if we've maxed up *n to SSIZE_MAX
+				 *     and it's still not big enought to fit our data. */
+				errno = EOVERFLOW;
+				return -1;
+			}
+			char * nlineptr = realloc(*lineptr, nn);
+			if (!nlineptr) return -1; /* malloc failure */
+			*n = nn;
+			*lineptr = nlineptr;
+		}
+
+		if (i == EOF) {
+			(*lineptr)[c] = '\0';
+			if (c) return c;
+			return -1;
+		}
+
+		(*lineptr)[c++] = i;
+		if (i == delimiter) break;
+	}
+
+	(*lineptr)[c] = '\0';
+	return c;
+}
+
+ssize_t getline(char **restrict lineptr, size_t *restrict n, FILE *restrict stream) {
+	return getdelim(lineptr, n, '\n', stream);
 }

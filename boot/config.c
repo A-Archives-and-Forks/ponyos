@@ -39,7 +39,7 @@ char * LINK_TEXT = "https://ponyos.org - https://github.com/klange/ponyos";
 /* Boot command line strings */
 #define DEFAULT_ROOT_CMDLINE "root=/dev/ram0 "
 #define DEFAULT_GRAPHICAL_CMDLINE "start=live-session "
-#define DEFAULT_SINGLE_CMDLINE "start=terminal\037-F "
+#define DEFAULT_SINGLE_CMDLINE "start=\"terminal -F\" "
 #define DEFAULT_TEXT_CMDLINE "start=--vga vid=text "
 #define DEFAULT_VID_CMDLINE "vid=auto "
 #define MIGRATE_CMDLINE "migrate "
@@ -104,6 +104,14 @@ int kmain() {
 	BOOT_OPTION(_equestria,   1, "Use Equestria font",
 			"Enables the thematically appropriate font",
 			"in desktop applications.");
+
+	BOOT_OPTION(_lfbwc,       1, "WC framebuffer",
+			"Enables write-combining PAT configuration for",
+			"framebuffers. Toggle if graphics are slow.");
+
+	BOOT_OPTION(_kaslr,       1, "KASLR (experimental)",
+			"Enables rudimentary randomization of the kernel",
+			"load address within a small range.");
 
 	while (1) {
 		/* Loop over rendering the menu */
@@ -170,6 +178,13 @@ int kmain() {
 		if (_qemubug) {
 			strcat(cmdline, "sharedps2 ");
 		}
+
+		if (_lfbwc) {
+			strcat(cmdline, "lfbwc ");
+		}
+
+		extern int disable_kaslr;
+		disable_kaslr = !_kaslr;
 
 		if (!boot_edit) break;
 		if (boot_editor()) break;

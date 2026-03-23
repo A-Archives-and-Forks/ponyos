@@ -10,6 +10,7 @@
  */
 #include <string.h>
 #include <stdlib.h>
+#include <va_list.h>
 #include <sys/shm.h>
 
 #include <toaru/pex.h>
@@ -120,10 +121,11 @@ yutani_msg_t * yutani_poll(yutani_t * y) {
 		return out;
 	}
 
-	size_t size;
+	ssize_t size;
 	{
 		char tmp[MAX_PACKET_SIZE];
 		size = pex_recv(y->sock, tmp);
+		if (size <= 0) return NULL;
 		out = malloc(size);
 		memcpy(out, tmp, size);
 	}
@@ -190,7 +192,7 @@ void yutani_msg_buildx_window_new(yutani_msg_t * msg, uint32_t width, uint32_t h
 }
 
 
-void yutani_msg_buildx_window_new_flags(yutani_msg_t * msg, uint32_t width, uint32_t height, uint32_t flags) {
+void yutani_msg_buildx_window_new_flags(yutani_msg_t * msg, uint32_t width, uint32_t height, uint32_t flags, yutani_wid_t parent_wid) {
 	msg->magic = YUTANI_MSG__MAGIC;
 	msg->type  = YUTANI_MSG_WINDOW_NEW_FLAGS;
 	msg->size  = sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_new_flags);
@@ -200,6 +202,7 @@ void yutani_msg_buildx_window_new_flags(yutani_msg_t * msg, uint32_t width, uint
 	mw->width = width;
 	mw->height = height;
 	mw->flags = flags;
+	mw->parent_wid = parent_wid;
 }
 
 
@@ -277,6 +280,17 @@ void yutani_msg_buildx_window_move_relative(yutani_msg_t * msg, yutani_wid_t wid
 	mw->wid_base = wid2;
 	mw->x = x;
 	mw->y = y;
+}
+
+void yutani_msg_buildx_window_set_parent(yutani_msg_t * msg, yutani_wid_t wid, yutani_wid_t wid2) {
+	msg->magic = YUTANI_MSG__MAGIC;
+	msg->type  = YUTANI_MSG_WINDOW_SET_PARENT;
+	msg->size  = sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_set_parent);
+
+	struct yutani_msg_window_set_parent * mw = (void *)msg->data;
+
+	mw->wid = wid;
+	mw->parent_wid = wid2;
 }
 
 void yutani_msg_buildx_window_stack(yutani_msg_t * msg, yutani_wid_t wid, int z) {
@@ -512,6 +526,19 @@ void yutani_msg_buildx_clipboard(yutani_msg_t * msg, char * content) {
 	memcpy(cl->content, content, strlen(content));
 }
 
+void yutani_msg_buildx_window_panel_size(yutani_msg_t * msg, yutani_wid_t wid, int32_t x, int32_t y, int32_t w, int32_t h) {
+	msg->magic = YUTANI_MSG__MAGIC;
+	msg->type  = YUTANI_MSG_WINDOW_PANEL_SIZE;
+	msg->size  = sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_panel_size);
+
+	struct yutani_msg_window_panel_size * ps = (void *)msg->data;
+	ps->wid = wid;
+	ps->x = x;
+	ps->y = y;
+	ps->w = w;
+	ps->h = h;
+}
+
 int yutani_msg_send(yutani_t * y, yutani_msg_t * msg) {
 	return pex_reply(y->sock, msg->size, (char *)msg);
 }
@@ -565,11 +592,20 @@ yutani_t * yutani_init(void) {
  *
  * Create a window with certain pre-specified properties.
  */
-yutani_window_t * yutani_window_create_flags(yutani_t * y, int width, int height, uint32_t flags) {
+yutani_window_t * yutani_window_create_flags(yutani_t * y, int width, int height, uint32_t flags, ...) {
+	va_list ap;
+	va_start(ap, flags);
+	yutani_wid_t parent_wid = 0;
+	if (flags & YUTANI_WINDOW_FLAG_PARENT_WID) {
+		yutani_window_t * parent = va_arg(ap, yutani_window_t *);
+		if (parent) parent_wid = parent->wid;
+	}
+	va_end(ap);
+
 	yutani_window_t * win = malloc(sizeof(yutani_window_t));
 
 	yutani_msg_buildx_window_new_flags_alloc(m);
-	yutani_msg_buildx_window_new_flags(m, width, height, flags);
+	yutani_msg_buildx_window_new_flags(m, width, height, flags, parent_wid);
 	yutani_msg_send(y, m);
 
 	yutani_msg_t * mm = yutani_wait_for(y, YUTANI_MSG_WINDOW_INIT);
@@ -671,6 +707,18 @@ void yutani_window_move(yutani_t * yctx, yutani_window_t * window, int x, int y)
 void yutani_window_move_relative(yutani_t * yctx, yutani_window_t * window, yutani_window_t * base, int x, int y) {
 	yutani_msg_buildx_window_move_relative_alloc(m);
 	yutani_msg_buildx_window_move_relative(m, window->wid, base->wid, x, y);
+	yutani_msg_send(yctx, m);
+}
+
+/**
+ * yutani_window_set_parent
+ *
+ * Tell the compositor that this window has a parent that should inherit its focus state
+ * for advertisements, and certain other properties (tbd.).
+ */
+void yutani_window_set_parent(yutani_t * yctx, yutani_window_t * window, yutani_window_t * parent) {
+	yutani_msg_buildx_window_set_parent_alloc(m);
+	yutani_msg_buildx_window_set_parent(m, window->wid, parent ? parent->wid : 0);
 	yutani_msg_send(yctx, m);
 }
 
@@ -1055,6 +1103,12 @@ void yutani_set_clipboard(yutani_t * yctx, char * content) {
 	}
 }
 
+void yutani_window_panel_size(yutani_t * yctx, yutani_wid_t wid, int32_t x, int32_t y, int32_t w, int32_t h) {
+	yutani_msg_buildx_window_panel_size_alloc(m);
+	yutani_msg_buildx_window_panel_size(m,wid,x,y,w,h);
+	yutani_msg_send(yctx, m);
+}
+
 /**
  * yutani_open_clipboard
  *
@@ -1135,4 +1189,16 @@ void release_graphics_yutani(gfx_context_t * gfx) {
 		free(gfx->backbuffer);
 	}
 	free(gfx);
+}
+
+void yutani_internal_refocus(yutani_t * yctx, yutani_window_t * window) {
+	/* Check if a refocus is already in our queue to be processed */
+	foreach(node, yctx->queued) {
+		yutani_msg_t * out = (yutani_msg_t *)node->value;
+		if (out->type == YUTANI_MSG_WINDOW_FOCUS_CHANGE) return;
+	}
+	/* Otherwise, produce an artificial one matching the reported focus state of the window */
+	yutani_msg_t * msg = malloc(sizeof(struct yutani_message) + sizeof(struct yutani_msg_window_focus_change));
+	yutani_msg_buildx_window_focus_change(msg, window->wid, window->focused);
+	list_insert(yctx->queued, msg);
 }

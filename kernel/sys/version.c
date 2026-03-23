@@ -23,7 +23,7 @@ const char * __kernel_name = "ponyos";
 const char * __kernel_version_format = "%d.%d.%d-%s";
 
 /* Version numbers X.Y.Z */
-int    __kernel_version_major = 8;
+int    __kernel_version_major = 9;
 int    __kernel_version_minor = 0;
 int    __kernel_version_lower = 0;
 
@@ -39,7 +39,7 @@ int    __kernel_version_lower = 0;
 const char * __kernel_version_suffix   = KERNEL_VERSION_SUFFIX;
 
 /* The release codename. */
-const char * __kernel_version_codename = "\"Friendship is Magic\"";
+const char * __kernel_version_codename = "\"Make Your Mark\"";
 
 /* Build architecture */
 const char * __kernel_arch = STRSTR(KERNEL_ARCH);

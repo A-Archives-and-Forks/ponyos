@@ -16,10 +16,12 @@
 #include <kernel/list.h>
 #include <kernel/syscall.h>
 #include <kernel/vfs.h>
+#include <kernel/mmu.h>
 
 #include <kernel/net/netif.h>
 
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 
 #ifndef MISAKA_DEBUG_NET
 #define printf(...)
@@ -103,14 +105,27 @@ void sock_generic_close(fs_node_t *node) {
 	printf("net: socket closed\n");
 }
 
+int sock_generic_ioctl(fs_node_t * node, unsigned long request, void * argp) {
+	sock_t * sock = (sock_t*)node;
+	switch (request) {
+		case FIONBIO: {
+			if (!mmu_validate_user_pointer(argp, sizeof(int), 0)) return -EFAULT;
+			sock->nonblocking = (!!*(int*)argp);
+			return 0;
+		}
+	}
+	return -EINVAL;
+}
+
 sock_t * net_sock_create(void) {
 	sock_t * sock = calloc(sizeof(struct SockData),1);
-	sock->_fnode.flags = FS_PIPE; /* uh, FS_SOCKET? */
+	sock->_fnode.flags = FS_SOCKET; /* uh, FS_SOCKET? */
 	sock->_fnode.mask = 0600;
 	sock->_fnode.device = NULL;
 	sock->_fnode.selectcheck = sock_generic_check;
 	sock->_fnode.selectwait = sock_generic_wait;
 	sock->_fnode.close = sock_generic_close;
+	sock->_fnode.ioctl = sock_generic_ioctl;
 	sock->alert_wait = list_create("socket alert wait", sock);
 	sock->rx_wait    = list_create("socket rx wait", sock);
 	sock->rx_queue   = list_create("socket rx queue", sock);
@@ -131,7 +146,10 @@ static long sock_raw_recv(sock_t * sock, struct msghdr * msg, int flags) {
 	char * data = net_sock_get(sock);
 	if (!data) return -EINTR;
 	size_t packet_size = *(size_t*)data;
-	if (msg->msg_iov[0].iov_len < packet_size) return -EINVAL;
+	if (msg->msg_iov[0].iov_len < packet_size) {
+		free(data);
+		return -EINVAL;
+	}
 	memcpy(msg->msg_iov[0].iov_base, data + sizeof(size_t), packet_size);
 	free(data);
 	return 4096;
@@ -159,7 +177,8 @@ static void sock_raw_close(sock_t * sock) {
  * Raw sockets
  */
 long net_raw_socket(int type, int protocol) {
-	if (type != SOCK_RAW) return -EINVAL;
+	if (type != SOCK_RAW) return -ESOCKTNOSUPPORT;
+	if (this_core->current_process->user != 0) return -EACCES;
 
 	/* Make a new raw socket? */
 	sock_t * sock = net_sock_create();
@@ -182,7 +201,7 @@ long net_socket(int domain, int type, int protocol) {
 		case AF_RAW:
 			return net_raw_socket(type, protocol);
 		default:
-			return -EINVAL;
+			return -EAFNOSUPPORT;
 	}
 }
 
@@ -200,13 +219,36 @@ long net_so_socket(struct SockData * sock, int optname, const void *optval, sock
 	}
 }
 
-long net_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+extern long net_so_ipv4_socket(struct SockData * sock, int optname, const void *optval, socklen_t optlen);
+
+static inline int is_socket(int sockfd) {
 	if (!FD_CHECK(sockfd)) return -EBADF;
+	fs_node_t * node = FD_ENTRY(sockfd);
+	if (!(node->flags & FS_SOCKET)) return -ENOTSOCK;
+	return 0;
+}
+
+#define CHECK_SOCK(sockfd) do { int x = is_socket(sockfd); if (x) return x; } while (0)
+
+#define ADDR_WR_ADDR 1
+#define ADDR_WR_LEN  2
+static inline int validate_addr_ptr(const struct sockaddr *addr, socklen_t * addrlen, int flags) {
+	if (!mmu_validate_user_pointer(addrlen, sizeof(socklen_t), (flags & ADDR_WR_LEN) ? MMU_PTR_WRITE : 0)) return -EFAULT;
+	if (!mmu_validate_user_pointer((void*)addr, *addrlen, (flags & ADDR_WR_ADDR) ? MMU_PTR_WRITE : 0)) return -EFAULT;
+	return 0;
+}
+
+#define CHECK_ADDR_ADDRLEN(addr,addrlen,flags) do { int x = validate_addr_ptr(addr,addrlen,flags); if (x) return x; } while (0)
+
+long net_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+	CHECK_SOCK(sockfd);
 	PTR_VALIDATE(optval);
 	sock_t * node = (sock_t*)FD_ENTRY(sockfd);
 	switch (level) {
 		case SOL_SOCKET:
 			return net_so_socket(node,optname,optval,optlen);
+		case IPPROTO_IP:
+			return net_so_ipv4_socket(node,optname,optval,optlen);
 		default:
 			return -ENOPROTOOPT;
 	}
@@ -214,48 +256,85 @@ long net_setsockopt(int sockfd, int level, int optname, const void *optval, sock
 }
 
 long net_getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen) {
-	if (!FD_CHECK(sockfd)) return -EBADF;
+	CHECK_SOCK(sockfd);
 	return -EINVAL;
 }
 
 long net_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-	if (!FD_CHECK(sockfd)) return -EBADF;
+	CHECK_SOCK(sockfd);
 	sock_t * node = (sock_t*)FD_ENTRY(sockfd);
 	if (!node->sock_bind) return -EINVAL;
 	return node->sock_bind(node, addr, addrlen);
 }
 
 long net_accept(int sockfd, struct sockaddr * addr, socklen_t * addrlen) {
-	if (!FD_CHECK(sockfd)) return -EBADF;
+	CHECK_SOCK(sockfd);
 	return -EINVAL;
 }
 
 long net_listen(int sockfd, int backlog) {
-	if (!FD_CHECK(sockfd)) return -EBADF;
+	CHECK_SOCK(sockfd);
 	return -EINVAL;
 }
 
 long net_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-	if (!FD_CHECK(sockfd)) return -EBADF;
+	CHECK_SOCK(sockfd);
 	sock_t * node = (sock_t*)FD_ENTRY(sockfd);
 	if (!node->sock_connect) return -EINVAL;
 	return node->sock_connect(node,addr,addrlen);
 }
 
+static int validate_msg(const struct msghdr * msg, int readonly) {
+	int flags = readonly ? 0 : MMU_PTR_WRITE;
+	if (!mmu_validate_user_pointer(msg,sizeof(struct msghdr),flags)) return 1;
+	if (msg->msg_iovlen) {
+		/* Check msg_name pointer */
+		if (msg->msg_name && !mmu_validate_user_pointer(msg->msg_name, (size_t)(msg->msg_namelen), flags)) return 1;
+		/* Check iovec structures */
+		if (!mmu_validate_user_pointer(msg->msg_iov, (size_t)(msg->msg_iovlen * sizeof(struct iovec)),flags)) return 1;
+		/* Check all the buffers in there */
+		for (size_t i = 0; i < msg->msg_iovlen; ++i) {
+			if (!mmu_validate_user_pointer(msg->msg_iov[i].iov_base, (size_t)(msg->msg_iov[i].iov_len), flags)) return 1;
+		}
+	}
+
+	/* Check control message space */
+	if (msg->msg_controllen && !mmu_validate_user_pointer(msg->msg_control, (size_t)(msg->msg_controllen), flags)) return 1;
+	return 0;
+}
+
 long net_recv(int sockfd, struct msghdr * msg, int flags) {
-	if (!FD_CHECK(sockfd)) return -EBADF;
+	CHECK_SOCK(sockfd);
 	PTR_VALIDATE(msg);
+	if (validate_msg(msg,0)) return -EFAULT;
 	sock_t * node = (sock_t*)FD_ENTRY(sockfd);
 	return node->sock_recv(node,msg,flags);
 }
 
 long net_send(int sockfd, const struct msghdr * msg, int flags) {
-	if (!FD_CHECK(sockfd)) return -EBADF;
+	CHECK_SOCK(sockfd);
 	PTR_VALIDATE(msg);
+	if (validate_msg(msg,1)) return -EFAULT;
 	sock_t * node = (sock_t*)FD_ENTRY(sockfd);
 	return node->sock_send(node,msg,flags);
 }
 
 long net_shutdown(int sockfd, int how) {
 	return -EINVAL;
+}
+
+long net_getsockname(int sockfd, struct sockaddr *addr, socklen_t * addrlen) {
+	CHECK_SOCK(sockfd);
+	CHECK_ADDR_ADDRLEN(addr,addrlen,ADDR_WR_ADDR|ADDR_WR_LEN);
+	sock_t * node = (sock_t*)FD_ENTRY(sockfd);
+	if (!node->sock_getsockname) return -EINVAL;
+	return node->sock_getsockname(node, addr, addrlen);
+}
+
+long net_getpeername(int sockfd, struct sockaddr *addr, socklen_t * addrlen) {
+	CHECK_SOCK(sockfd);
+	CHECK_ADDR_ADDRLEN(addr,addrlen,ADDR_WR_ADDR|ADDR_WR_LEN);
+	sock_t * node = (sock_t*)FD_ENTRY(sockfd);
+	if (!node->sock_getpeername) return -EINVAL;
+	return node->sock_getpeername(node, addr, addrlen);
 }

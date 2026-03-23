@@ -53,6 +53,7 @@ static ssize_t  term_width     = 80;    /* Width of the terminal (in cells) */
 static ssize_t  term_height    = 25;    /* Height of the terminal (in cells) */
 static uint16_t csr_x          = 0;    /* Cursor X */
 static uint16_t csr_y          = 0;    /* Cursor Y */
+static uint16_t csr_h          = 0;
 static term_cell_t * term_buffer    = NULL; /* The terminal cell buffer */
 static term_cell_t * term_buffer_a = NULL;
 static term_cell_t * term_buffer_b = NULL;
@@ -615,74 +616,119 @@ int is_wide(uint32_t codepoint) {
 	return wcwidth(codepoint) == 2;
 }
 
+static void undraw_cursor(void) {
+	cell_redraw(csr_x, csr_y);
+}
+
+static void normalize_x(int setting_lcf) {
+	if (csr_x >= term_width) {
+		csr_x = term_width - 1;
+		if (setting_lcf) {
+			csr_h = 1;
+		}
+	}
+}
+
+static void normalize_y(void) {
+	if (csr_y == term_height) {
+		term_scroll(1);
+		csr_y = term_height - 1;
+	}
+}
+
+
 void term_write(char c) {
 	static uint32_t codepoint = 0;
 	static uint32_t unicode_state = 0;
 
-	cell_redraw(csr_x, csr_y);
 	if (!decode(&unicode_state, &codepoint, (uint8_t)c)) {
-		if (c == '\r') {
-			csr_x = 0;
-			draw_cursor();
-			return;
-		}
-		if (csr_x == term_width) {
-			csr_x = 0;
-			++csr_y;
-			if (c == '\n') return;
-		}
-		if (csr_y == term_height) {
-			term_scroll(1);
-			csr_y = term_height - 1;
-		}
-		if (c == '\n') {
-			++csr_y;
-			if (csr_y == term_height) {
-				term_scroll(1);
-				csr_y = term_height - 1;
-			}
-			draw_cursor();
-		} else if (c == '\007') {
-			/* bell */
-		} else if (c == '\b') {
-			if (csr_x > 0) {
-				--csr_x;
-			}
-			cell_redraw(csr_x, csr_y);
-			draw_cursor();
-		} else if (c == '\t') {
-			csr_x += (8 - csr_x % 8);
-			draw_cursor();
-		} else {
-			int wide = is_wide(codepoint);
-			uint8_t flags = ansi_state->flags;
-			if (wide && csr_x == term_width - 1) {
-				csr_x = 0;
+		uint32_t o = codepoint;
+		codepoint = 0;
+
+		switch (c) {
+			case '\a':
+				/* boop */
+				return;
+
+			case '\r':
+				undraw_cursor();
+				csr_x = csr_h = 0;
+				draw_cursor();
+				return;
+
+			case '\t':
+				undraw_cursor();
+				csr_x += (8 - csr_x % 8);
+				normalize_x(0);
+				draw_cursor();
+				return;
+
+			case '\v':
+			case '\f':
+			case '\n':
+				undraw_cursor();
+				csr_h = 0;
 				++csr_y;
-			}
-			if (wide) {
-				flags = flags | ANSI_WIDE;
-			}
-			cell_set(csr_x,csr_y, codepoint, current_fg, current_bg, flags);
-			cell_redraw(csr_x,csr_y);
-			csr_x++;
-			if (wide && csr_x != term_width) {
-				cell_set(csr_x, csr_y, 0xFFFF, current_fg, current_bg, ansi_state->flags);
+				normalize_y();
+				draw_cursor();
+				return;
+
+			case '\b':
+				if (csr_x > 0) {
+					undraw_cursor();
+					--csr_x;
+					draw_cursor();
+				}
+				csr_h = 0;
+				return;
+
+			default: {
+				int wide = is_wide(o);
+				uint8_t flags = ansi_state->flags;
+
+				undraw_cursor();
+
+				if (csr_h || (wide && csr_x == term_width - 1)) {
+					csr_x = csr_h = 0;
+					++csr_y;
+					normalize_y();
+				}
+
+				if (wide) {
+					flags = flags | ANSI_WIDE;
+				}
+
+				cell_set(csr_x,csr_y, o, current_fg, current_bg, flags);
 				cell_redraw(csr_x,csr_y);
-				cell_redraw(csr_x-1,csr_y);
 				csr_x++;
+
+				if (wide && csr_x != term_width) {
+					cell_set(csr_x, csr_y, 0xFFFF, current_fg, current_bg, ansi_state->flags);
+					cell_redraw(csr_x,csr_y);
+					cell_redraw(csr_x-1,csr_y);
+					csr_x++;
+				}
+
+				normalize_x(1);
+				draw_cursor();
+				return;
 			}
 		}
 	} else if (unicode_state == UTF8_REJECT) {
 		unicode_state = 0;
+		codepoint = 0;
 	}
-	draw_cursor();
 }
 
 void term_set_csr(int x, int y) {
 	cell_redraw(csr_x,csr_y);
+	if (x < 0) x = 0;
+	if (x >= term_width) x = term_width - 1;
+	if (y < 0) y = 0;
+	if (y >= term_height) y = term_height - 1;
 	csr_x = x;
 	csr_y = y;
+	csr_h = 0;
 	draw_cursor();
 }
 
@@ -736,6 +782,7 @@ void term_clear(int i) {
 		/* Oh dear */
 		csr_x = 0;
 		csr_y = 0;
+		csr_h = 0;
 		memset((void *)term_buffer, 0x00, term_width * term_height * sizeof(term_cell_t));
 		term_redraw_all();
 	} else if (i == 0) {
@@ -956,9 +1003,33 @@ static void term_switch_buffer(int buffer) {
 
 		term_redraw_all();
 	}
-
 }
 
+static void full_reset(void) {
+	/* Reset everything */
+	csr_x = 0;
+	csr_y = 0;
+	csr_h = 0;
+
+	/* Huh, why don't we haven't an _orig_h - surely hold should be saved? */
+	_orig_x = 0;
+	_orig_y = 0;
+
+	current_fg = TERM_DEFAULT_FG;
+	current_bg = TERM_DEFAULT_BG;
+	_orig_fg = TERM_DEFAULT_FG;
+	_orig_bg = TERM_DEFAULT_BG;
+
+	active_buffer = 0;
+	term_buffer = term_buffer_a;
+
+	/* Clear both buffers to 0 */
+	memset((void *)term_buffer_a, 0x00, term_width * term_height * sizeof(term_cell_t));
+	memset((void *)term_buffer_b, 0x00, term_width * term_height * sizeof(term_cell_t));
+
+	/* Enable cursor */
+	cursor_on = 1;
+}
 
 term_callbacks_t term_callbacks = {
 	term_write,
@@ -978,6 +1049,7 @@ term_callbacks_t term_callbacks = {
 	term_set_csr_show,
 	term_switch_buffer,
 	insert_delete_lines,
+	full_reset,
 };
 
 void reinit(void) {
@@ -1071,6 +1143,11 @@ static void redraw_mouse(void) {
 static unsigned int button_state = 0;
 
 void handle_mouse_event(mouse_device_packet_t * packet) {
+	if (mouse_x < 0) mouse_x = 0;
+	if (mouse_y < 0) mouse_y = 0;
+	if (mouse_x >= term_width) mouse_x = term_width - 1;
+	if (mouse_y >= term_height) mouse_y = term_height - 1;
+
 	static uint64_t last_click = 0;
 	if (ansi_state->mouse_on & TERMEMU_MOUSE_ENABLE) {
 		/* TODO: Handle shift */
@@ -1154,10 +1231,6 @@ void handle_mouse(mouse_device_packet_t * packet) {
 	mouse_x = rel_mouse_x / 20;
 	mouse_y = rel_mouse_y / 40;
 
-	if (mouse_x < 0) mouse_x = 0;
-	if (mouse_y < 0) mouse_y = 0;
-	if (mouse_x >= term_width) mouse_x = term_width - 1;
-	if (mouse_y >= term_height) mouse_y = term_height - 1;
 	handle_mouse_event(packet);
 }
 
@@ -1251,6 +1324,8 @@ int main(int argc, char ** argv) {
 		dup2(fd_slave, 0);
 		dup2(fd_slave, 1);
 		dup2(fd_slave, 2);
+		ioctl(STDIN_FILENO, TIOCSCTTY, &(int){1});
+		tcsetpgrp(STDIN_FILENO, getpid());
 
 		if (argv[optind] != NULL) {
 			char * tokens[] = {argv[optind], NULL};

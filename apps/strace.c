@@ -7,6 +7,7 @@
  * Copyright (C) 2021 K. Lange
  */
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -20,29 +21,13 @@
 #include <sys/sysfunc.h>
 #include <sys/utsname.h>
 #include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/uregs.h>
 #include <syscall_nums.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 static FILE * logfile;
-
-#ifdef __x86_64__
-# include <kernel/arch/x86_64/regs.h>
-# define syscall_result(r) ((r)->rax)
-# define syscall_num(r)    ((r)->rax)
-# define syscall_arg1(r)   ((r)->rbx)
-# define syscall_arg2(r)   ((r)->rcx)
-# define syscall_arg3(r)   ((r)->rdx)
-# define syscall_arg4(r)   ((r)->rsi)
-# define syscall_arg5(r)   ((r)->rdi)
-#elif defined(__aarch64__)
-# include <kernel/arch/aarch64/regs.h>
-# define syscall_result(r) ((r)->x0)
-# define syscall_num(r)    ((r)->x0)
-# define syscall_arg1(r)   ((r)->x1)
-# define syscall_arg2(r)   ((r)->x2)
-# define syscall_arg3(r)   ((r)->x3)
-# define syscall_arg4(r)   ((r)->x4)
-# define syscall_arg5(r)   ((r)->x5)
-#endif
 
 /* System call names */
 const char * syscall_names[] = {
@@ -117,6 +102,22 @@ const char * syscall_names[] = {
 	[SYS_RECV]         = "recv",
 	[SYS_SEND]         = "send",
 	[SYS_SHUTDOWN]     = "shutdown",
+	[SYS_SIGACTION]    = "sigaction",
+	[SYS_SIGPENDING]   = "sigpending",
+	[SYS_SIGPROCMASK]  = "sigprocmask",
+	[SYS_SIGSUSPEND]   = "sigsuspend",
+	[SYS_SIGWAIT]      = "sigwait",
+	[SYS_PREAD]        = "pread",
+	[SYS_PWRITE]       = "pwrite",
+	[SYS_RENAME]       = "rename",
+	[SYS_FCNTL]        = "fcntl",
+	[SYS_FCHMOD]       = "fchmod",
+	[SYS_FCHOWN]       = "fchown",
+	[SYS_TRUNCATE]     = "truncate",
+	[SYS_FTRUNCATE]    = "ftruncate",
+	[SYS_SETTIMEOFDAY] = "settimeofday",
+	[SYS_GETSOCKNAME]  = "getsockname",
+	[SYS_GETPEERNAME]  = "getpeername",
 };
 
 char syscall_mask[] = {
@@ -191,6 +192,22 @@ char syscall_mask[] = {
 	[SYS_RECV]         = 1,
 	[SYS_SEND]         = 1,
 	[SYS_SHUTDOWN]     = 1,
+	[SYS_PREAD]        = 1,
+	[SYS_PWRITE]       = 1,
+	[SYS_SIGACTION]    = 1,
+	[SYS_SIGPENDING]   = 1,
+	[SYS_SIGPROCMASK]  = 1,
+	[SYS_SIGSUSPEND]   = 1,
+	[SYS_SIGWAIT]      = 1,
+	[SYS_RENAME]       = 1,
+	[SYS_FCNTL]        = 1,
+	[SYS_FCHMOD]       = 1,
+	[SYS_FCHOWN]       = 1,
+	[SYS_TRUNCATE]     = 1,
+	[SYS_FTRUNCATE]    = 1,
+	[SYS_SETTIMEOFDAY] = 1,
+	[SYS_GETSOCKNAME]  = 1,
+	[SYS_GETPEERNAME]  = 1,
 };
 
 #define M(e) [e] = #e
@@ -311,6 +328,7 @@ const char * errno_names[] = {
 	M(EOWNERDEAD),
 	M(ESTRPIPE),
 	M(ERESTARTSYS),
+	M(ERESTARTSIGSUSPEND),
 };
 
 
@@ -354,24 +372,16 @@ const char * signal_names[NSIG] = {
 	M(SIGTTOU),
 };
 
-#if 0
-static void dump_regs(struct regs * r) {
-	fprintf(logfile,
-		"  $rip=0x%016lx\n"
-		"  $rsi=0x%016lx,$rdi=0x%016lx,$rbp=0x%016lx,$rsp=0x%016lx\n"
-		"  $rax=0x%016lx,$rbx=0x%016lx,$rcx=0x%016lx,$rdx=0x%016lx\n"
-		"  $r8= 0x%016lx,$r9= 0x%016lx,$r10=0x%016lx,$r11=0x%016lx\n"
-		"  $r12=0x%016lx,$r13=0x%016lx,$r14=0x%016lx,$r15=0x%016lx\n"
-		"  cs=0x%016lx  ss=0x%016lx rflags=0x%016lx int=0x%02lx err=0x%02lx\n",
-		r->rip,
-		r->rsi, r->rdi, r->rbp, r->rsp,
-		r->rax, r->rbx, r->rcx, r->rdx,
-		r->r8, r->r9, r->r10, r->r11,
-		r->r12, r->r13, r->r14, r->r15,
-		r->cs, r->ss, r->rflags, r->int_no, r->err_code
-	);
-}
-#endif
+const char * fcntl_cmd_names[] = {
+	M(F_GETFD),
+	M(F_SETFD),
+	M(F_GETFL),
+	M(F_SETFL),
+	M(F_DUPFD),
+	M(F_GETLK),
+	M(F_SETLK),
+	M(F_SETLKW),
+};
 
 static void open_flags(int flags) {
 	if (!flags) {
@@ -421,7 +431,7 @@ static void string_arg(pid_t pid, uintptr_t ptr) {
 
 		if (buf == '\\') fprintf(logfile, "\\\\");
 		else if (buf == '"') fprintf(logfile, "\\\"");
-		else if (buf >= ' ' && buf < '~') fprintf(logfile, "%c", buf);
+		else if (buf >= ' ' && buf <= '~') fprintf(logfile, "%c", buf);
 		else if (buf == '\r') fprintf(logfile, "\\r");
 		else if (buf == '\n') fprintf(logfile, "\\n");
 		else fprintf(logfile, "\\x%02x", buf);
@@ -450,9 +460,66 @@ static void int_arg(size_t val) {
 	fprintf(logfile, "%zd", val);
 }
 
+static void mode_arg(mode_t val) {
+	fprintf(logfile, "%#03o", val);
+}
+
 static void fd_arg(pid_t pid, int val) {
 	/* TODO: Look up file in user data? */
 	fprintf(logfile, "%d", val);
+}
+
+static void sock_dom_arg(int domain) {
+	switch (domain) {
+		C(AF_UNSPEC);
+		C(AF_RAW);
+		C(AF_INET);
+		default: fprintf(logfile, "%d", domain); break;
+	}
+}
+
+static void sock_typ_arg(int type) {
+	switch (type) {
+		C(SOCK_DGRAM);
+		C(SOCK_STREAM);
+		C(SOCK_RAW);
+		default: fprintf(logfile, "%d", type); break;
+	}
+}
+
+static void sock_pro_arg(int domain, int type, int proto) {
+	switch (domain) {
+		case AF_INET:
+			switch (proto) {
+				C(IPPROTO_IP);
+				C(IPPROTO_ICMP);
+				C(IPPROTO_TCP);
+				C(IPPROTO_UDP);
+				default:
+					fprintf(logfile, "%d", proto);
+					break;
+			}
+			return;
+	}
+
+	/* Fallback case */
+	fprintf(logfile, "%d", proto);
+}
+
+static void sock_lvl_arg(int level) {
+	switch (level) {
+		C(SOL_SOCKET);
+		default: fprintf(logfile, "%d", level); break;
+	}
+}
+
+static void sock_opt_arg(int opt) {
+	switch (opt) {
+		C(SO_KEEPALIVE);
+		C(SO_REUSEADDR);
+		C(SO_BINDTODEVICE);
+		default: fprintf(logfile, "%d", opt); break;
+	}
 }
 
 static int data_read_bytes(pid_t pid, uintptr_t addr, char * buf, size_t size) {
@@ -475,6 +542,34 @@ static uintptr_t data_read_ptr(pid_t pid, uintptr_t addr) {
 	data_read_bytes(pid, addr, (char*)&x, sizeof(uintptr_t));
 	return x;
 }
+
+static void sockaddr_arg(pid_t pid, uintptr_t addr, size_t size) {
+	if (addr == 0) {
+		fprintf(logfile, "null");
+		return;
+	}
+
+	struct sockaddr_storage sa = {0};
+	data_read_bytes(pid, addr, (char*)&sa, size < sizeof(struct sockaddr_storage) ? size : sizeof(struct sockaddr_storage));
+
+	fprintf(logfile, "{sa_family=");
+	sock_dom_arg(sa.ss_family);
+
+	if (sa.ss_family == AF_INET && size >= sizeof(struct sockaddr_in)) {
+		struct sockaddr_in addr;
+		memcpy(&addr, &sa, sizeof(struct sockaddr_in));
+		fprintf(logfile, ", sin_port=htons(%d), sin_addr=inet_addr(\"%s\")", ntohs(addr.sin_port), inet_ntoa(addr.sin_addr));
+	}
+
+	fprintf(logfile, "}");
+}
+
+static void sockaddrp_arg(pid_t pid, uintptr_t addr, uintptr_t size_p) {
+	size_t size = 0;
+	data_read_bytes(pid, size_p, (char*)&size, sizeof(size_t));
+	sockaddr_arg(pid,addr,size);
+}
+
 
 static void fds_arg(pid_t pid, size_t ecount, uintptr_t array) {
 	fprintf(logfile, "[");
@@ -528,6 +623,33 @@ static void buffer_arg(pid_t pid, uintptr_t buffer, ssize_t count) {
 	}
 }
 
+static void msghdr_arg(pid_t pid, uintptr_t msghdr) {
+	struct msghdr data = {0};
+	if (data_read_bytes(pid, msghdr, (char*)&data, sizeof(struct msghdr))) {
+		fprintf(logfile, "(?)");
+	} else {
+		fprintf(logfile, "{msg_name=%#zx,msg_iovlen=%zu,msg_iov[0]=", (uintptr_t)data.msg_name, data.msg_iovlen);
+		if (data.msg_iovlen > 0) {
+			struct iovec iodata = {0};
+			if (data_read_bytes(pid, (uintptr_t)data.msg_iov, (char*)&iodata, sizeof(struct iovec))) {
+				fprintf(logfile,"?");
+			} else {
+				fprintf(logfile,"{iov_base=%#zx,iov_len=%zu}", (uintptr_t)iodata.iov_base, iodata.iov_len);
+			}
+		}
+		fprintf(logfile,"}");
+	}
+}
+
+static void fcntl_cmd_arg(long cmd) {
+	const char * name = (cmd >= 0 && (size_t)cmd < (sizeof(fcntl_cmd_names) / sizeof(*fcntl_cmd_names))) ? fcntl_cmd_names[cmd] : NULL;
+	if (name) {
+		fprintf(logfile, "%s", name);
+	} else {
+		fprintf(logfile, "%ld", cmd);
+	}
+}
+
 static void print_error(int err) {
 	const char * name = (err >= 0 && (size_t)err < (sizeof(errno_names) / sizeof(*errno_names))) ? errno_names[err] : NULL;
 	if (name) {
@@ -537,9 +659,9 @@ static void print_error(int err) {
 	}
 }
 
-static void maybe_errno(struct regs * r) {
-	fprintf(logfile, ") = %ld", syscall_result(r));
-	if ((intptr_t)syscall_result(r) < 0) print_error(syscall_result(r));
+static void maybe_errno(struct URegs * r) {
+	fprintf(logfile, ") = %ld", uregs_syscall_result(r));
+	if ((intptr_t)uregs_syscall_result(r) < 0) print_error(-uregs_syscall_result(r));
 	fprintf(logfile, "\n");
 }
 
@@ -582,121 +704,185 @@ static void signal_arg(int signum) {
 	}
 }
 
-static void handle_syscall(pid_t pid, struct regs * r) {
-	if (syscall_num(r) >= sizeof(syscall_mask)) return;
-	if (!syscall_mask[syscall_num(r)]) return;
+static void sigset_ptr_arg(pid_t pid, uintptr_t ptr) {
+	if (!ptr) {
+		fprintf(logfile, "NULL");
+		return;
+	}
 
-	fprintf(logfile, "%s(", syscall_names[syscall_num(r)]);
-	switch (syscall_num(r)) {
+	uint64_t sigset = data_read_ptr(pid, ptr);
+
+	/* handle special cases */
+	if (sigset == 0xFFFFffffFFFFffff) {
+		fprintf(logfile, "sigfillset()");
+		return;
+	} else if (sigset == 0) {
+		fprintf(logfile, "sigemptyset()");
+		return;
+	}
+
+	uint64_t x = (1ULL << NUMSIGNALS) - 2; /* 0 is also unused */
+	sigset &= x;
+
+	fprintf(logfile, "{");
+	for (int i = 1; i < NUMSIGNALS; ++i) {
+		uint64_t s = 1ULL << i;
+		if (sigset & s) {
+			signal_arg(i);
+			sigset &= ~s;
+			if (sigset) {
+				fprintf(logfile, "|");
+			}
+		}
+	}
+	fprintf(logfile, "}");
+}
+
+static void signal_ptr_arg(pid_t pid, uintptr_t ptr) {
+	int i = data_read_int(pid, ptr);
+	fprintf(logfile, "{");
+	signal_arg(i);
+	fprintf(logfile, "}");
+}
+
+static void handle_syscall(pid_t pid, struct URegs * r) {
+	if (uregs_syscall_num(r) >= sizeof(syscall_mask)) return;
+	if (!syscall_mask[uregs_syscall_num(r)]) return;
+
+	fprintf(logfile, "%s(", syscall_names[uregs_syscall_num(r)]);
+	switch (uregs_syscall_num(r)) {
 		case SYS_OPEN:
-			string_arg(pid, syscall_arg1(r)); COMMA;
-			open_flags(syscall_arg2(r));
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			open_flags(uregs_syscall_arg2(r));
+			break;
+		case SYS_CHMOD:
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			mode_arg(uregs_syscall_arg2(r));
+			break;
+		case SYS_CHOWN:
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r)); COMMA;
+			int_arg(uregs_syscall_arg3(r));
+			break;
+		case SYS_TRUNCATE:
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_READ:
-			fd_arg(pid, syscall_arg1(r)); COMMA;
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
 			/* Plus two more when done */
 			break;
 		case SYS_WRITE:
-			fd_arg(pid, syscall_arg1(r)); COMMA;
-			buffer_arg(pid, syscall_arg2(r), syscall_arg3(r)); COMMA;
-			uint_arg(syscall_arg3(r));
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			buffer_arg(pid, uregs_syscall_arg2(r), uregs_syscall_arg3(r)); COMMA;
+			uint_arg(uregs_syscall_arg3(r));
+			break;
+		case SYS_PREAD:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			/* Plus three more when done */
+			break;
+		case SYS_PWRITE:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			buffer_arg(pid, uregs_syscall_arg2(r), uregs_syscall_arg3(r)); COMMA;
+			uint_arg(uregs_syscall_arg3(r)); COMMA;
+			int_arg(uregs_syscall_arg4(r));
 			break;
 		case SYS_CLOSE:
-			fd_arg(pid, syscall_arg1(r));
+			fd_arg(pid, uregs_syscall_arg1(r));
 			break;
 		case SYS_SBRK:
-			uint_arg(syscall_arg1(r));
+			uint_arg(uregs_syscall_arg1(r));
 			break;
 		case SYS_SEEK:
-			fd_arg(pid, syscall_arg1(r)); COMMA;
-			int_arg(syscall_arg2(r)); COMMA;
-			switch (syscall_arg3(r)) {
-				case 0: fprintf(logfile, "SEEK_SET"); break;
-				case 1: fprintf(logfile, "SEEK_CUR"); break;
-				case 2: fprintf(logfile, "SEEK_END"); break;
-				default: int_arg(syscall_arg3(r)); break;
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r)); COMMA;
+			switch (uregs_syscall_arg3(r)) {
+				C(SEEK_SET);
+				C(SEEK_CUR);
+				C(SEEK_END);
+				default: int_arg(uregs_syscall_arg3(r)); break;
 			}
 			break;
 		case SYS_STATF:
-			string_arg(pid, syscall_arg1(r)); COMMA;
-			pointer_arg(syscall_arg2(r));
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			pointer_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_LSTAT:
-			string_arg(pid, syscall_arg1(r)); COMMA;
-			pointer_arg(syscall_arg2(r));
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			pointer_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_READDIR:
-			fd_arg(pid, syscall_arg1(r)); COMMA;
-			int_arg(syscall_arg2(r)); COMMA;
-			pointer_arg(syscall_arg3(r));
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r)); COMMA;
+			pointer_arg(uregs_syscall_arg3(r));
 			break;
 		case SYS_KILL:
-			int_arg(syscall_arg1(r)); COMMA; /* pid_arg? */
-			int_arg(syscall_arg2(r)); /* TODO signal name */
+			int_arg(uregs_syscall_arg1(r)); COMMA; /* pid_arg? */
+			signal_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_CHDIR:
-			string_arg(pid, syscall_arg1(r));
+			string_arg(pid, uregs_syscall_arg1(r));
 			break;
 		case SYS_GETCWD:
 			/* output is first arg */
-			pointer_arg(syscall_arg1(r)); COMMA; /* TODO syscall outputs */
-			uint_arg(syscall_arg2(r));
+			pointer_arg(uregs_syscall_arg1(r)); COMMA; /* TODO syscall outputs */
+			uint_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_CLONE:
-			pointer_arg(syscall_arg1(r)); COMMA;
-			pointer_arg(syscall_arg2(r)); COMMA;
-			pointer_arg(syscall_arg3(r));
+			pointer_arg(uregs_syscall_arg1(r)); COMMA;
+			pointer_arg(uregs_syscall_arg2(r)); COMMA;
+			pointer_arg(uregs_syscall_arg3(r));
 			break;
 		case SYS_SETHOSTNAME:
-			string_arg(pid, syscall_arg1(r));
+			string_arg(pid, uregs_syscall_arg1(r));
 			break;
 		case SYS_GETHOSTNAME:
 			/* plus one more when done */
 			break;
 		case SYS_MKDIR:
-			string_arg(pid, syscall_arg1(r)); COMMA;
-			uint_arg(syscall_arg2(r));
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			uint_arg(uregs_syscall_arg2(r));
 			break;
-		case SYS_SHUTDOWN:
-			int_arg(syscall_arg1(r)); COMMA;
-			int_arg(syscall_arg2(r));
+		case SYS_RENAME:
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			string_arg(pid, uregs_syscall_arg2(r));
 			break;
 		case SYS_ACCESS:
-			string_arg(pid, syscall_arg1(r)); COMMA;
-			int_arg(syscall_arg2(r));
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_PTRACE:
-			switch (syscall_arg1(r)) {
+			switch (uregs_syscall_arg1(r)) {
 				C(PTRACE_ATTACH);
 				C(PTRACE_CONT);
 				C(PTRACE_DETACH);
 				C(PTRACE_TRACEME);
 				C(PTRACE_GETREGS);
 				C(PTRACE_PEEKDATA);
-				default: int_arg(syscall_arg1(r)); break;
+				default: int_arg(uregs_syscall_arg1(r)); break;
 			} COMMA;
-			int_arg(syscall_arg2(r)); COMMA;
-			pointer_arg(syscall_arg3(r)); COMMA;
-			pointer_arg(syscall_arg4(r));
+			int_arg(uregs_syscall_arg2(r)); COMMA;
+			pointer_arg(uregs_syscall_arg3(r)); COMMA;
+			pointer_arg(uregs_syscall_arg4(r));
 			break;
 		case SYS_EXECVE:
-			string_arg(pid, syscall_arg1(r)); COMMA;
-			string_array_arg(pid, syscall_arg2(r)); COMMA;
-			pointer_arg(syscall_arg3(r));
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			string_array_arg(pid, uregs_syscall_arg2(r)); COMMA;
+			pointer_arg(uregs_syscall_arg3(r));
 			break;
 		case SYS_SHM_OBTAIN:
-			string_arg(pid, syscall_arg1(r)); COMMA;
-			pointer_arg(syscall_arg2(r));
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			pointer_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_SHM_RELEASE:
-			string_arg(pid, syscall_arg1(r));
+			string_arg(pid, uregs_syscall_arg1(r));
 			break;
 		case SYS_SIGNAL:
-			signal_arg(syscall_arg1(r)); COMMA;
-			pointer_arg(syscall_arg2(r));
+			signal_arg(uregs_syscall_arg1(r)); COMMA;
+			pointer_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_SYSFUNC:
-			switch (syscall_arg1(r)) {
+			switch (uregs_syscall_arg1(r)) {
 				C(TOARU_SYS_FUNC_SYNC);
 				C(TOARU_SYS_FUNC_LOGHERE);
 				C(TOARU_SYS_FUNC_KDEBUG);
@@ -706,71 +892,163 @@ static void handle_syscall(pid_t pid, struct regs * r) {
 				C(TOARU_SYS_FUNC_THREADNAME);
 				C(TOARU_SYS_FUNC_SETGSBASE);
 				C(TOARU_SYS_FUNC_NPROC);
-				default: int_arg(syscall_arg1(r)); break;
+				C(TOARU_SYS_FUNC_CLEARICACHE);
+				C(TOARU_SYS_FUNC_MUNMAP);
+				default: int_arg(uregs_syscall_arg1(r)); break;
 			} COMMA;
-			pointer_arg(syscall_arg2(r));
+			pointer_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_FSWAIT:
-			int_arg(syscall_arg1(r)); COMMA;
-			fds_arg(pid, syscall_arg1(r), syscall_arg2(r));
+			int_arg(uregs_syscall_arg1(r)); COMMA;
+			fds_arg(pid, uregs_syscall_arg1(r), uregs_syscall_arg2(r));
 			break;
 		case SYS_FSWAIT2:
-			int_arg(syscall_arg1(r)); COMMA;
-			fds_arg(pid, syscall_arg1(r), syscall_arg2(r)); COMMA;
-			int_arg(syscall_arg3(r));
+			int_arg(uregs_syscall_arg1(r)); COMMA;
+			fds_arg(pid, uregs_syscall_arg1(r), uregs_syscall_arg2(r)); COMMA;
+			int_arg(uregs_syscall_arg3(r));
 			break;
 		case SYS_FSWAIT3:
-			int_arg(syscall_arg1(r)); COMMA;
-			fds_arg(pid, syscall_arg1(r), syscall_arg2(r)); COMMA;
-			int_arg(syscall_arg3(r)); COMMA;
-			pointer_arg(syscall_arg4(r));
+			int_arg(uregs_syscall_arg1(r)); COMMA;
+			fds_arg(pid, uregs_syscall_arg1(r), uregs_syscall_arg2(r)); COMMA;
+			int_arg(uregs_syscall_arg3(r)); COMMA;
+			pointer_arg(uregs_syscall_arg4(r));
 			break;
 		case SYS_IOCTL:
-			fd_arg(pid, syscall_arg1(r)); COMMA;
-			int_arg(syscall_arg2(r)); COMMA;
-			pointer_arg(syscall_arg3(r));
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r)); COMMA;
+			pointer_arg(uregs_syscall_arg3(r));
 			break;
 		case SYS_WAITPID:
-			int_arg(syscall_arg1(r)); COMMA;
-			pointer_arg(syscall_arg2(r)); COMMA;
-			int_arg(syscall_arg3(r)); /* TODO waitpid options */
+			int_arg(uregs_syscall_arg1(r)); COMMA;
+			pointer_arg(uregs_syscall_arg2(r)); COMMA;
+			int_arg(uregs_syscall_arg3(r)); /* TODO waitpid options */
 			break;
 		case SYS_EXT:
-			int_arg(syscall_arg1(r));
+			int_arg(uregs_syscall_arg1(r));
 			fprintf(logfile, ") = ?\n");
 			return;
 		case SYS_UNAME:
 			/* One output arg */
 			break;
 		case SYS_SLEEPABS:
-			uint_arg(syscall_arg1(r)); COMMA;
-			uint_arg(syscall_arg2(r));
+			uint_arg(uregs_syscall_arg1(r)); COMMA;
+			uint_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_SLEEP:
-			uint_arg(syscall_arg1(r)); COMMA;
-			uint_arg(syscall_arg2(r));
+			uint_arg(uregs_syscall_arg1(r)); COMMA;
+			uint_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_PIPE:
 			/* Arg is a pointer */
 			break;
 		case SYS_DUP2:
-			fd_arg(pid, syscall_arg1(r)); COMMA;
-			fd_arg(pid, syscall_arg2(r));
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			fd_arg(pid, uregs_syscall_arg2(r));
+			break;
+		case SYS_FCNTL:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			fcntl_cmd_arg(uregs_syscall_arg2(r)); COMMA;
+			int_arg(uregs_syscall_arg3(r));
+			break;
+		case SYS_FCHMOD:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			mode_arg(uregs_syscall_arg2(r));
+			break;
+		case SYS_FCHOWN:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r)); COMMA;
+			int_arg(uregs_syscall_arg3(r));
+			break;
+		case SYS_FTRUNCATE:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r));
 			break;
 		case SYS_MOUNT:
-			string_arg(pid, syscall_arg1(r)); COMMA;
-			string_arg(pid, syscall_arg2(r)); COMMA;
-			uint_arg(syscall_arg3(r)); COMMA;
-			pointer_arg(syscall_arg4(r));
+			string_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			string_arg(pid, uregs_syscall_arg2(r)); COMMA;
+			uint_arg(uregs_syscall_arg3(r)); COMMA;
+			pointer_arg(uregs_syscall_arg4(r));
 			break;
 		case SYS_UMASK:
-			int_arg(syscall_arg1(r));
+			int_arg(uregs_syscall_arg1(r));
 			break;
 		case SYS_UNLINK:
-			string_arg(pid, syscall_arg1(r));
+			string_arg(pid, uregs_syscall_arg1(r));
 			break;
 		case SYS_GETTIMEOFDAY:
 			/* two output args */
+			break;
+		case SYS_SETTIMEOFDAY:
+			struct_timeval_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			pointer_arg(uregs_syscall_arg2(r));
+			break;
+		case SYS_SIGACTION:
+			signal_arg(uregs_syscall_arg1(r)); COMMA;
+			pointer_arg(uregs_syscall_arg2(r)); COMMA;
+			pointer_arg(uregs_syscall_arg3(r)); /* sigaction output */
+			break;
+		case SYS_SIGPENDING:
+			/* output only */
+			break;
+		case SYS_SIGPROCMASK:
+			switch (uregs_syscall_arg1(r)) {
+				C(SIG_BLOCK);
+				C(SIG_UNBLOCK);
+				C(SIG_SETMASK);
+				default: int_arg(uregs_syscall_arg1(r)); break;
+			} COMMA;
+			sigset_ptr_arg(pid, uregs_syscall_arg2(r)); COMMA;
+			/* one more after with old set */
+			break;
+		case SYS_SIGSUSPEND:
+			sigset_ptr_arg(pid, uregs_syscall_arg1(r));
+			break;
+		case SYS_SIGWAIT:
+			sigset_ptr_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			break;
+		case SYS_SOCKET:
+			sock_dom_arg(uregs_syscall_arg1(r)); COMMA;
+			sock_typ_arg(uregs_syscall_arg2(r)); COMMA;
+			sock_pro_arg(uregs_syscall_arg1(r), uregs_syscall_arg2(r), uregs_syscall_arg3(r));
+			break;
+		case SYS_RECV:
+		case SYS_SEND:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			msghdr_arg(pid, uregs_syscall_arg2(r)); COMMA;
+			int_arg(uregs_syscall_arg3(r));
+			break;
+		case SYS_LISTEN:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r));
+			break;
+		case SYS_CONNECT:
+		case SYS_ACCEPT:
+		case SYS_BIND:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			sockaddr_arg(pid, uregs_syscall_arg2(r), uregs_syscall_arg3(r)); /* Consumes both */
+			break;
+		case SYS_GETSOCKNAME:
+		case SYS_GETPEERNAME:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			/* two output args */
+			break;
+		case SYS_SHUTDOWN:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			int_arg(uregs_syscall_arg2(r)); /* TODO SHUT_... */
+			break;
+		case SYS_SETSOCKOPT:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			sock_lvl_arg(uregs_syscall_arg2(r)); COMMA;
+			sock_opt_arg(uregs_syscall_arg3(r)); COMMA;
+			pointer_arg(uregs_syscall_arg4(r)); COMMA; /* TODO sockaddr in some contexts */
+			uint_arg(uregs_syscall_arg5(r));
+			break;
+		case SYS_GETSOCKOPT:
+			fd_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			sock_lvl_arg(uregs_syscall_arg2(r)); COMMA;
+			sock_opt_arg(uregs_syscall_arg3(r)); COMMA;
+			pointer_arg(uregs_syscall_arg4(r)); COMMA; /* TODO sockaddr in some contexts */
+			pointer_arg(uregs_syscall_arg5(r)); /* Note - differs from set */
 			break;
 		/* These have no arguments: */
 		case SYS_YIELD:
@@ -791,7 +1069,7 @@ static void handle_syscall(pid_t pid, struct regs * r) {
 	fflush(stdout);
 }
 
-static void finish_syscall(pid_t pid, int syscall, struct regs * r) {
+static void finish_syscall(pid_t pid, int syscall, struct URegs * r) {
 	if (syscall >= (int)sizeof(syscall_mask)) return;
 	if (syscall >= 0 && !syscall_mask[syscall]) return;
 
@@ -800,33 +1078,52 @@ static void finish_syscall(pid_t pid, int syscall, struct regs * r) {
 			break; /* This is ptrace(PTRACE_TRACEME)... probably... */
 		/* read() returns data in second value */
 		case SYS_READ:
-			buffer_arg(pid, syscall_arg2(r), syscall_result(r)); COMMA;
-			uint_arg(syscall_arg3(r));
+			buffer_arg(pid, uregs_syscall_arg2(r), uregs_syscall_result(r)); COMMA;
+			uint_arg(uregs_syscall_arg3(r));
+			maybe_errno(r);
+			break;
+		case SYS_PREAD:
+			buffer_arg(pid, uregs_syscall_arg2(r), uregs_syscall_result(r)); COMMA;
+			uint_arg(uregs_syscall_arg3(r)); COMMA;
+			int_arg(uregs_syscall_arg4(r));
 			maybe_errno(r);
 			break;
 		case SYS_GETHOSTNAME:
-			string_arg(pid, syscall_arg1(r));
+			string_arg(pid, uregs_syscall_arg1(r));
 			maybe_errno(r);
 			break;
 		case SYS_UNAME:
-			struct_utsname_arg(pid, syscall_arg1(r));
+			struct_utsname_arg(pid, uregs_syscall_arg1(r));
 			maybe_errno(r);
 			break;
 		case SYS_PIPE:
-			fds_arg(pid, 2, syscall_arg1(r));
+			fds_arg(pid, 2, uregs_syscall_arg1(r));
 			maybe_errno(r);
 			break;
 		case SYS_GETTIMEOFDAY:
-			struct_timeval_arg(pid, syscall_arg1(r));
+			struct_timeval_arg(pid, uregs_syscall_arg1(r)); COMMA;
+			pointer_arg(uregs_syscall_arg2(r));
 			maybe_errno(r);
 			break;
 		/* sbrk() returns an address */
 		case SYS_SBRK:
-			fprintf(logfile, ") = %#zx\n", syscall_result(r));
+			fprintf(logfile, ") = %#zx\n", uregs_syscall_result(r));
 			break;
 		case SYS_EXECVE:
 			if (r == NULL) fprintf(logfile, ") = 0\n");
 			else maybe_errno(r);
+			break;
+		case SYS_SIGPROCMASK:
+			sigset_ptr_arg(pid, uregs_syscall_arg3(r));
+			maybe_errno(r);
+			break;
+		case SYS_SIGWAIT:
+			signal_ptr_arg(pid, uregs_syscall_arg2(r));
+			maybe_errno(r);
+			break;
+		case SYS_GETSOCKNAME:
+		case SYS_GETPEERNAME:
+			sockaddrp_arg(pid, uregs_syscall_arg2(r), uregs_syscall_arg3(r)); /* Consumes both */
 			break;
 		/* Most things return -errno, or positive valid result */
 		default:
@@ -881,6 +1178,7 @@ int main(int argc, char * argv[]) {
 								int syscalls[] = {
 									SYS_SOCKET, SYS_SETSOCKOPT, SYS_BIND, SYS_ACCEPT, SYS_LISTEN,
 									SYS_CONNECT, SYS_GETSOCKOPT, SYS_RECV, SYS_SEND, SYS_SHUTDOWN,
+									SYS_GETPEERNAME, SYS_GETSOCKNAME,
 									0
 								};
 								for (int *i = syscalls; *i; i++) {
@@ -890,7 +1188,8 @@ int main(int argc, char * argv[]) {
 								int syscalls[] = {
 									SYS_OPEN, SYS_STATF, SYS_LSTAT, SYS_ACCESS, SYS_EXECVE,
 									SYS_GETCWD, SYS_CHDIR, SYS_MKDIR, SYS_SYMLINK, SYS_UNLINK,
-									SYS_CHMOD, SYS_CHOWN, SYS_MOUNT, SYS_READLINK,
+									SYS_CHMOD, SYS_CHOWN, SYS_MOUNT, SYS_READLINK, SYS_RENAME,
+									SYS_TRUNCATE,
 									0
 								};
 								for (int *i = syscalls; *i; i++) {
@@ -899,8 +1198,9 @@ int main(int argc, char * argv[]) {
 							} else if (!strcmp(option+1,"desc")) {
 								int syscalls[] = {
 									SYS_OPEN, SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_STAT, SYS_FSWAIT,
-									SYS_FSWAIT2, SYS_FSWAIT3, SYS_SEEK, SYS_IOCTL, SYS_PIPE, SYS_MKPIPE,
-									SYS_DUP2, SYS_READDIR, SYS_OPENPTY,
+									SYS_FSWAIT2, SYS_FSWAIT3, SYS_SEEK, SYS_IOCTL, SYS_PIPE,
+									SYS_DUP2, SYS_READDIR, SYS_OPENPTY, SYS_PREAD, SYS_PWRITE, SYS_FCNTL,
+									SYS_FCHMOD, SYS_FCHOWN, SYS_FTRUNCATE,
 									0
 								};
 								for (int *i = syscalls; *i; i++) {
@@ -924,7 +1224,8 @@ int main(int argc, char * argv[]) {
 								}
 							} else if (!strcmp(option+1,"signal")) {
 								int syscalls[] = {
-									SYS_SIGNAL, SYS_KILL,
+									SYS_SIGNAL, SYS_KILL, SYS_SIGACTION, SYS_SIGPENDING, SYS_SIGPROCMASK,
+									SYS_SIGSUSPEND, SYS_SIGWAIT,
 									0
 								};
 								for (int *i = syscalls; *i; i++) {
@@ -1014,7 +1315,7 @@ int main(int argc, char * argv[]) {
 		} else {
 			if (WIFSTOPPED(status)) {
 				if (WSTOPSIG(status) == SIGTRAP) {
-					struct regs regs;
+					struct URegs regs;
 					ptrace(PTRACE_GETREGS, p, NULL, &regs);
 
 					/* Event type */
@@ -1022,7 +1323,7 @@ int main(int argc, char * argv[]) {
 					switch (event) {
 						case PTRACE_EVENT_SYSCALL_ENTER:
 							if (previous_syscall == SYS_EXECVE) finish_syscall(p,SYS_EXECVE,NULL);
-							previous_syscall = syscall_num(&regs);
+							previous_syscall = uregs_syscall_num(&regs);
 							handle_syscall(p, &regs);
 							break;
 						case PTRACE_EVENT_SYSCALL_EXIT:

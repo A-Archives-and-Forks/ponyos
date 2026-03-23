@@ -16,13 +16,13 @@
 #include <unistd.h>
 #include <poll.h>
 #include <signal.h>
-#include <sys/times.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 
-#define BYTES_TO_SEND 56
+#define BYTES_TO_SEND 64
 
 struct ICMP_Header {
 	uint8_t type, code;
@@ -31,6 +31,12 @@ struct ICMP_Header {
 	uint16_t sequence_number;
 	uint8_t payload[];
 };
+
+static unsigned long clocktime(void) {
+	struct timeval tv;
+	gettimeofday(&tv,NULL);
+	return tv.tv_sec * 1000000 + tv.tv_usec;
+}
 
 static uint16_t icmp_checksum(char * payload, size_t len) {
 	uint32_t sum = 0;
@@ -72,13 +78,16 @@ int main(int argc, char * argv[]) {
 		return 1;
 	}
 
+	int yes = 1;
+	setsockopt(sock, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(int));
+
 	signal(SIGINT, sig_break_loop);
 
 	struct sockaddr_in dest;
 	dest.sin_family = AF_INET;
 	memcpy(&dest.sin_addr.s_addr, host->h_addr, host->h_length);
 
-	printf("PING %s (%s) %d data bytes\n", argv[1], addr, BYTES_TO_SEND);
+	printf("PING %s (%s) %d data bytes\n", argv[1], addr, BYTES_TO_SEND - 8);
 
 	struct ICMP_Header * ping = malloc(BYTES_TO_SEND);
 	ping->type = 8; /* request */
@@ -98,7 +107,7 @@ int main(int argc, char * argv[]) {
 		ping->checksum = htons(icmp_checksum((void*)ping, BYTES_TO_SEND));
 
 		/* Send it and wait */
-		clock_t sent_at = times(NULL);
+		unsigned long sent_at = clocktime();
 		if (sendto(sock, (void*)ping, BYTES_TO_SEND, 0, (struct sockaddr*)&dest, sizeof(struct sockaddr_in)) < 0) {
 			fprintf(stderr, "sendto: %s\n", strerror(errno));
 		}
@@ -112,14 +121,40 @@ int main(int argc, char * argv[]) {
 
 		if (ret > 0) {
 			char data[4096];
+			char control[4096];
 			struct sockaddr_in source;
 			socklen_t source_size = sizeof(struct sockaddr_in);
-			ssize_t len = recvfrom(sock, data, 4096, 0, (struct sockaddr*)&source, &source_size);
-			clock_t rcvd_at = times(NULL);
+			struct iovec _iovec = {
+				data, 4096
+			};
+			struct msghdr msg = {
+				&source,
+				source_size,
+				&_iovec,
+				1,
+				control,
+				4096,
+				0
+			};
+			ssize_t len = recvmsg(sock, &msg, 0);
+			unsigned long rcvd_at = clocktime();
 			if (len > 0) {
 				/* Is it actually a PING response ? */
 
 				struct ICMP_Header * icmp = (void*)data;
+				unsigned char ttl = 0;
+
+				if (msg.msg_controllen) {
+					char * control_msg = control;
+					while (control_msg - control + sizeof(struct cmsghdr) <= msg.msg_controllen) {
+						struct cmsghdr * cmsg = (void*)control_msg;
+						if (cmsg->cmsg_level == IPPROTO_IP && (cmsg->cmsg_type == IP_RECVTTL || cmsg->cmsg_type == IP_TTL)) {
+							memcpy(&ttl, CMSG_DATA(cmsg), 1);
+							break;
+						}
+						control_msg += cmsg->cmsg_len;
+					}
+				}
 
 				if (icmp->type == 0) {
 					/* How much data, minus the header? */
@@ -127,7 +162,7 @@ int main(int argc, char * argv[]) {
 					char * from = inet_ntoa(source.sin_addr);
 					int time_taken = (rcvd_at - sent_at);
 					printf("%zd bytes from %s: icmp_seq=%d ttl=%d time=%d",
-						len, from, ntohs(icmp->sequence_number), (unsigned char)source.sin_zero[0], /* we hide the ttl in here */
+						len, from, ntohs(icmp->sequence_number), (unsigned char)ttl,
 						time_taken / 1000);
 					if (time_taken < 1000) {
 						printf(".%03d", time_taken % 1000);

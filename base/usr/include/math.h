@@ -53,6 +53,7 @@ extern double atanh(double x);
 extern double erf(double x);
 extern double erfc(double x);
 extern double gamma(double x);
+extern double tgamma(double x);
 extern double lgamma(double x);
 extern double copysign(double x, double y);
 extern double remainder(double x, double y);
@@ -67,5 +68,10 @@ extern int fpclassify(double x);
 #define isnormal(x) (fpclassify(x) == FP_NORMAL)
 #define isnan(x)    (fpclassify(x) == FP_NAN)
 #define isinf(x)    (fpclassify(x) == FP_INFINITE)
+
+extern float ceilf(float x);
+extern double round(double x);
+extern float roundf(float x);
+extern long lroundf(float x);
 
 _End_C_Header

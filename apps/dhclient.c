@@ -6,6 +6,7 @@
  * of the NCSA / University of Illinois License - see LICENSE.md
  * Copyright (C) 2021 K. Lange
  */
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -249,7 +250,7 @@ extern char * _argv_0;
 static int configure_interface(const char * if_name) {
 	/* Open a raw socket. */
 	int sock = socket(AF_RAW, SOCK_RAW, 0);
-	if (!sock) {
+	if (sock < 0) {
 		perror(_argv_0);
 		return 1;
 	}

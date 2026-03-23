@@ -64,6 +64,11 @@ static void clear_input_buffer(pty_t * pty) {
 #define input_process tty_input_process
 
 void tty_output_process_slave(pty_t * pty, uint8_t c) {
+	if (!(pty->tios.c_oflag & OPOST)) {
+		OUT(c);
+		return;
+	}
+
 	if (c == '\n' && (pty->tios.c_oflag & ONLCR)) {
 		c = '\n';
 		OUT(c);
@@ -77,7 +82,7 @@ void tty_output_process_slave(pty_t * pty, uint8_t c) {
 	}
 
 	if (c >= 'a' && c <= 'z' && (pty->tios.c_oflag & OLCUC)) {
-		c = c + 'a' - 'A';
+		c = c + 'A' - 'a';
 		OUT(c);
 		return;
 	}
@@ -123,7 +128,7 @@ void tty_input_process(pty_t * pty, uint8_t c) {
 			pty->canon_buflen++;
 		}
 		if (pty->tios.c_lflag & ECHO) {
-			if (is_control(c)) {
+			if ((pty->tios.c_lflag & ECHOCTL) && is_control(c)) {
 				output_process(pty, '^');
 				output_process(pty, ('@'+c) % 128);
 			} else {
@@ -144,9 +149,12 @@ void tty_input_process(pty_t * pty, uint8_t c) {
 		/* VSUSP */
 		if (sig != -1) {
 			if (pty->tios.c_lflag & ECHO) {
-				output_process(pty, '^');
-				output_process(pty, ('@' + c) % 128);
-				output_process(pty, '\n');
+				if ((pty->tios.c_lflag & ECHOCTL) && is_control(c)) {
+					output_process(pty, '^');
+					output_process(pty, ('@' + c) % 128);
+				} else {
+					output_process(pty, c);
+				}
 			}
 			clear_input_buffer(pty);
 			if (pty->fg_proc) {
@@ -179,6 +187,10 @@ void tty_input_process(pty_t * pty, uint8_t c) {
 		c = '\n';
 	}
 
+	if ((pty->tios.c_iflag & IUCLC) && (c >= 'A' && c <= 'Z')) {
+		c = c - 'A' + 'a';
+	}
+
 	if (pty->tios.c_lflag & ICANON) {
 
 		if (c == pty->tios.c_cc[VLNEXT] && (pty->tios.c_lflag & IEXTEN)) {
@@ -193,8 +205,12 @@ void tty_input_process(pty_t * pty, uint8_t c) {
 				erase_one(pty, pty->tios.c_lflag & ECHOK);
 			}
 			if ((pty->tios.c_lflag & ECHO) && ! (pty->tios.c_lflag & ECHOK)) {
-				output_process(pty, '^');
-				output_process(pty, ('@' + c) % 128);
+				if ((pty->tios.c_lflag & ECHOCTL) && is_control(c)) {
+					output_process(pty, '^');
+					output_process(pty, ('@' + c) % 128);
+				} else {
+					output_process(pty, c);
+				}
 			}
 			return;
 		}
@@ -202,8 +218,12 @@ void tty_input_process(pty_t * pty, uint8_t c) {
 			/* Backspace */
 			erase_one(pty, pty->tios.c_lflag & ECHOE);
 			if ((pty->tios.c_lflag & ECHO) && ! (pty->tios.c_lflag & ECHOE)) {
-				output_process(pty, '^');
-				output_process(pty, ('@' + c) % 128);
+				if ((pty->tios.c_lflag & ECHOCTL) && is_control(c)) {
+					output_process(pty, '^');
+					output_process(pty, ('@' + c) % 128);
+				} else {
+					output_process(pty, c);
+				}
 			}
 			return;
 		}
@@ -215,8 +235,12 @@ void tty_input_process(pty_t * pty, uint8_t c) {
 				erase_one(pty, pty->tios.c_lflag & ECHOE);
 			}
 			if ((pty->tios.c_lflag & ECHO) && ! (pty->tios.c_lflag & ECHOE)) {
-				output_process(pty, '^');
-				output_process(pty, ('@' + c) % 128);
+				if ((pty->tios.c_lflag & ECHOCTL) && is_control(c)) {
+					output_process(pty, '^');
+					output_process(pty, ('@' + c) % 128);
+				} else {
+					output_process(pty, c);
+				}
 			}
 			return;
 		}
@@ -234,7 +258,7 @@ void tty_input_process(pty_t * pty, uint8_t c) {
 			pty->canon_buflen++;
 		}
 		if (pty->tios.c_lflag & ECHO) {
-			if (is_control(c) && c != '\n') {
+			if ((pty->tios.c_lflag & ECHOCTL) && is_control(c) && c != '\n') {
 				output_process(pty, '^');
 				output_process(pty, ('@' + c) % 128);
 			} else {
@@ -251,7 +275,12 @@ void tty_input_process(pty_t * pty, uint8_t c) {
 		}
 		return;
 	} else if (pty->tios.c_lflag & ECHO) {
-		output_process(pty, c);
+		if ((pty->tios.c_lflag & ECHOCTL) && is_control(c) && c != '\n') {
+			output_process(pty, '^');
+			output_process(pty, ('@' + c) % 128);
+		} else {
+			output_process(pty, c);
+		}
 	}
 	IN(c);
 }
@@ -312,15 +341,38 @@ int pty_ioctl(pty_t * pty, unsigned long request, void * argp) {
 			validate(argp);
 			*(pid_t *)argp = pty->fg_proc;
 			return 0;
+		case TIOCSCTTY:
+			/* If this is already the control session, quietly ignore. */
+			if (this_core->current_process->session == this_core->current_process->id &&
+				pty->ct_proc == this_core->current_process->session) {
+				return 0;
+			}
+			/* If we aren't a session leader, we can't do this. */
+			if (this_core->current_process->session != this_core->current_process->id) {
+				return -EPERM;
+			}
+			/* If there's already a control session, only root can steal control, and only if *argp is 1
+			 * (on Linux, that's "if argp is 1", but we kinda messed this up by checking ioctl argp stuff
+			 * for bounds validity in the system call layer, so instead we use a pointer to 1... */
+			if (pty->ct_proc && (!argp || (*(int*)argp != 1) || this_core->current_process->user != 0)) {
+				return -EPERM;
+			}
+			pty->ct_proc = this_core->current_process->session;
+			return 0;
 		case TCSETS:
 		case TCSETSW:
-		case TCSETSF:
 			if (!argp) return -EINVAL;
 			validate(argp);
+			/* TODO wait on output for SETSW */
 			if (!(((struct termios *)argp)->c_lflag & ICANON) && (pty->tios.c_lflag & ICANON)) {
 				/* Switch out of canonical mode, the dump the input buffer */
 				dump_input_buffer(pty);
 			}
+			goto tcset_common;
+		case TCSETSF:
+			clear_input_buffer(pty);
+			ring_buffer_discard(pty->in);
+		tcset_common:
 			memcpy(&pty->tios, argp, sizeof(struct termios));
 			return 0;
 		default:
@@ -351,22 +403,57 @@ void     close_pty_master(fs_node_t * node) {
 	return;
 }
 
+static int ignoring(int sig) {
+	if (this_core->current_process->blocked_signals & (1ULL << sig)) return 1;
+	if (this_core->current_process->signals[sig].handler == 1) return 1;
+	return 0;
+}
+
 ssize_t read_pty_slave(fs_node_t * node, off_t offset, size_t size, uint8_t *buffer) {
 	pty_t * pty = (pty_t *)node->device;
+
+	/* If this process *is* part of this tty's session, but is NOT in the foreground job
+	 * and it tries to read from the TTY, then send it SIGTTIN - but only if it's not
+	 * ignoring it. If it is ignoring, make the write fail with EIO. */
+	if (pty->ct_proc == this_core->current_process->session && pty->fg_proc && this_core->current_process->job != pty->fg_proc) {
+		if (ignoring(SIGTTIN)) return -EIO;
+		group_send_signal(this_core->current_process->job, SIGTTIN, 1);
+		return -ERESTARTSYS;
+	}
 
 	if (pty->tios.c_lflag & ICANON) {
 		return ring_buffer_read(pty->in, size, buffer);
 	} else {
 		if (pty->tios.c_cc[VMIN] == 0) {
-			return ring_buffer_read(pty->in, MIN(size, ring_buffer_unread(pty->in)), buffer);
+			return ring_buffer_read(pty->in, size, buffer);
 		} else {
-			return ring_buffer_read(pty->in, MIN(pty->tios.c_cc[VMIN], size), buffer);
+			ssize_t c = 0;
+			ssize_t vmin = MIN(pty->tios.c_cc[VMIN], size);
+			while (c < vmin) {
+				ssize_t r = ring_buffer_read(pty->in, size - c, buffer + c);
+				if (r < 0) return c ? c : r;
+				c += r;
+			}
+			return c;
 		}
 	}
 }
 
 ssize_t write_pty_slave(fs_node_t * node, off_t offset, size_t size, uint8_t *buffer) {
 	pty_t * pty = (pty_t *)node->device;
+
+	if (pty->tios.c_lflag & TOSTOP) {
+		/* If TOSTOP is enabled and this process *is* part of this tty's session but
+		 * is NOT in the foreground job, then send the whole job SIGTTOU - but only
+		 * if we weren't ignoring SIGTTOU ourselves. If we were ignoring it, then
+		 * the write can continue without issue. */
+		if (pty->ct_proc == this_core->current_process->session && pty->fg_proc && this_core->current_process->job != pty->fg_proc) {
+			if (!ignoring(SIGTTOU)) {
+				group_send_signal(this_core->current_process->job, SIGTTOU, 1);
+				return -ERESTARTSYS;
+			}
+		}
+	}
 
 	size_t l = 0;
 	for (uint8_t * c = buffer; l < size; ++c, ++l) {
@@ -644,8 +731,8 @@ void pty_install(void) {
 	_pty_dir   = create_pty_dir();
 	_dev_tty   = create_dev_tty();
 
-	vfs_mount("/dev/pts", _pty_dir);
-	vfs_mount("/dev/tty", _dev_tty);
+	vfs_mount("/dev/pts", _pty_dir, "pts", "");
+	vfs_mount("/dev/tty", _dev_tty, "devtty", "");
 }
 
 pty_t * pty_new(struct winsize * size, int index) {
@@ -693,8 +780,8 @@ pty_t * pty_new(struct winsize * size, int index) {
 
 	pty->tios.c_iflag = ICRNL | BRKINT;
 	pty->tios.c_oflag = ONLCR | OPOST;
-	pty->tios.c_lflag = ECHO | ECHOE | ECHOK | ICANON | ISIG | IEXTEN;
-	pty->tios.c_cflag = CREAD | CS8;
+	pty->tios.c_lflag = ECHO | ECHOE | ECHOK | ICANON | ISIG | IEXTEN | ECHOCTL;
+	pty->tios.c_cflag = CREAD | CS8 | B38400;
 	pty->tios.c_cc[VEOF]   =  4; /* ^D */
 	pty->tios.c_cc[VEOL]   =  0; /* Not set */
 	pty->tios.c_cc[VERASE] = 0x7f; /* ^? */

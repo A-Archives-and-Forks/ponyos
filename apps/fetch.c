@@ -161,10 +161,11 @@ int collect_password(char * password) {
 	return 0;
 }
 
+#define MAX_HTTP_LINE 1024
 void read_http_line(char * buf, FILE * f) {
-	memset(buf, 0x00, 256);
+	memset(buf, 0x00, MAX_HTTP_LINE);
 
-	fgets(buf, 255, f);
+	fgets(buf, MAX_HTTP_LINE-1, f);
 	char * _r = strchr(buf, '\r');
 	if (_r) {
 		*_r = '\0';
@@ -187,7 +188,7 @@ int http_fetch(FILE * f) {
 
 	/* Parse response */
 	{
-		char buf[256];
+		char buf[MAX_HTTP_LINE];
 		read_http_line(buf, f);
 
 		char * elements[3];
@@ -211,7 +212,7 @@ int http_fetch(FILE * f) {
 
 	/* Parse headers */
 	while (1) {
-		char buf[256];
+		char buf[MAX_HTTP_LINE];
 		read_http_line(buf, f);
 
 		if (!*buf) {
@@ -330,6 +331,10 @@ int main(int argc, char * argv[]) {
 	fetch_options.out = stdout;
 	if (fetch_options.output_file) {
 		fetch_options.out = fopen(fetch_options.output_file, "w+");
+		if (!fetch_options.out) {
+			perror("fopen");
+			return 1;
+		}
 	}
 
 	int sock = socket(AF_INET, SOCK_STREAM, 0);

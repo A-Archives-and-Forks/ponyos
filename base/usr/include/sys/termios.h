@@ -81,6 +81,7 @@ typedef unsigned char cc_t;
 #define   VT1   0040000
 
 /* baud rates */
+#define CBAUD   0100017
 #define B0      0000000
 #define B50     0000001
 #define B75     0000002
@@ -97,6 +98,11 @@ typedef unsigned char cc_t;
 #define B9600   0000015
 #define B19200  0000016
 #define B38400  0000017
+#define B57600  0100000
+#define B115200 0100001
+#define B230400 0100002
+#define B460800 0100003
+#define B921600 0100004
 
 /* control modes */
 #define CSIZE   0000060
@@ -122,6 +128,7 @@ typedef unsigned char cc_t;
 #define NOFLSH  0000200
 #define TOSTOP  0000400
 #define IEXTEN  0001000
+#define ECHOCTL 0002000
 
 /* attributes */
 #define TCSANOW   0x0001

@@ -8,6 +8,7 @@
  * Copyright (C) 2021-2022 K. Lange
  */
 #include <stdint.h>
+#include <kernel/args.h>
 #include <kernel/process.h>
 #include <kernel/string.h>
 #include <kernel/printf.h>
@@ -16,6 +17,7 @@
 
 #include <kernel/arch/aarch64/regs.h>
 #include <kernel/arch/aarch64/gic.h>
+#include <kernel/arch/aarch64/dtb.h>
 
 /**
  * @brief Enter userspace.
@@ -36,6 +38,8 @@ void arch_enter_user(uintptr_t entrypoint, int argc, char * argv[], char * envp[
 		"msr SPSR_EL1, %2\n" /* EL 0 */
 		::
 		"r"(entrypoint), "r"(stack), "r"(0));
+
+	update_process_times_on_exit();
 
 	register uint64_t x0 __asm__("x0") = argc;
 	register uint64_t x1 __asm__("x1") = (uintptr_t)argv;
@@ -69,7 +73,7 @@ static void _kill_it(uintptr_t addr, const char * action, const char * desc, siz
 	stack += sizeof(type); \
 } while (0)
 
-void arch_return_from_signal_handler(struct regs *r) {
+int arch_return_from_signal_handler(struct regs *r) {
 	uintptr_t spsr;
 	uintptr_t sp = r->user_sp;
 
@@ -80,6 +84,10 @@ void arch_return_from_signal_handler(struct regs *r) {
 		POP(sp, uint64_t, this_core->current_process->thread.fp_regs[63-i]);
 	}
 	arch_restore_floating((process_t*)this_core->current_process);
+
+	POP(sp, sigset_t, this_core->current_process->blocked_signals);
+	long originalSignal;
+	POP(sp, long, originalSignal);
 
 	/* Interrupt system call status */
 	POP(sp, long, this_core->current_process->interrupted_system_call);
@@ -95,6 +103,7 @@ void arch_return_from_signal_handler(struct regs *r) {
 	POP(sp, struct regs, *r);
 
 	asm volatile ("msr SP_EL0, %0" :: "r"(r->user_sp));
+	return originalSignal;
 }
 
 /**
@@ -126,6 +135,12 @@ void arch_enter_signal_handler(uintptr_t entrypoint, int signum, struct regs *r)
 	PUSH(sp, long, this_core->current_process->interrupted_system_call);
 	this_core->current_process->interrupted_system_call = 0;
 
+	PUSH(sp, long, signum);
+	PUSH(sp, sigset_t, this_core->current_process->blocked_signals);
+
+	struct signal_config * config = (struct signal_config*)&this_core->current_process->signals[signum];
+	this_core->current_process->blocked_signals |= config->mask | (config->flags & SA_NODEFER ? 0 : (1UL << signum));
+
 	/* Save floating point */
 	arch_save_floating((process_t*)this_core->current_process);
 	for (int i = 0; i < 64; ++i) {
@@ -133,6 +148,8 @@ void arch_enter_signal_handler(uintptr_t entrypoint, int signum, struct regs *r)
 	}
 	PUSH(sp, uintptr_t, this_core->current_process->thread.context.saved[12]);
 	PUSH(sp, uintptr_t, this_core->current_process->thread.context.saved[13]);
+
+	update_process_times_on_exit();
 
 	asm volatile(
 		"msr ELR_EL1, %0\n" /* entrypoint */
@@ -144,7 +161,7 @@ void arch_enter_signal_handler(uintptr_t entrypoint, int signum, struct regs *r)
 		"r"(0));
 
 	register uint64_t x0 __asm__("x0") = signum;
-	register uint64_t x30 __asm__("x30") = 0x8DEADBEEF;
+	register uint64_t x30 __asm__("x30") = 0x516;
 	register uint64_t x4 __asm__("x4") = (uintptr_t)this_core->sp_el1;
 
 	asm volatile(
@@ -284,6 +301,26 @@ void arch_wakeup_others(void) {
  * do a full shutdown.
  */
 long arch_reboot(void) {
+	arch_fatal_prepare(); /* Ensure other cores stop. */
+
+	/* This semihosting SYS_EXIT interface only works under TCG */
+	if (args_present("semihosting")) {
+		uint64_t payload[2] = {0x20026, 0x0};
+		register uint32_t w0 asm("w0") = 0x18;
+		register uint64_t x1 asm("x1") = (uintptr_t)payload;
+		asm volatile ("hlt #0xF000" :: "r"(w0), "r"(x1) : "memory");
+	}
+
+	uint32_t * psci = dtb_find_node("psci");
+	if (psci) {
+		/* Try to force the QEMU SYSTEM_RESET interface if we have PSCI at all. */
+		register uint64_t x0 asm("x0") = 0x84000009;
+		register uint64_t x1 asm("x1") = 0;
+		asm volatile ("hvc 0" :: "r"(x0), "r"(x1) : "memory");
+	}
+
+	dprintf("aarch64: No reboot method. Halting.\n");
+	arch_fatal();
 	return 0;
 }
 
@@ -351,10 +388,123 @@ void outportb(unsigned short _port, unsigned char _data) {
 void outportsm(unsigned short port, unsigned char * data, unsigned long size) {
 }
 
+/* From DRM sources */
+#define fourcc_code(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
+                                 ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+#define DRM_FORMAT_XRGB8888     fourcc_code('X', 'R', '2', '4') /* [31:0] x:R:G:B 8:8:8:8 little endian */
+
+static void ramfb_init(void) {
+	extern uint8_t * lfb_vid_memory;
+	extern uint16_t lfb_resolution_x;
+	extern uint16_t lfb_resolution_y;
+	extern uint16_t lfb_resolution_b;
+	extern uint32_t lfb_resolution_s;
+	extern size_t lfb_memsize;
+
+	struct ramfbcfg {
+		uint64_t addr;
+		uint32_t fourcc;
+		uint32_t flags;
+		uint32_t width;
+		uint32_t height;
+		uint32_t stride;
+	} __attribute__((packed));
+
+	uint32_t * fw_cfg = dtb_find_node_prefix("fw-cfg");
+	if (!fw_cfg) {
+		dprintf("ramfb: no fw-cfg interface?\n");
+		return;
+	}
+	uint32_t * regs = dtb_node_find_property(fw_cfg, "reg");
+	if (!regs) {
+		dprintf("ramfb: no regs for fw-cfg\n");
+		return;
+	}
+
+	volatile uint8_t * fw_cfg_addr = (volatile uint8_t*)(uintptr_t)(mmu_map_from_physical(swizzle(regs[3])));
+	volatile uint64_t * fw_cfg_data = (volatile uint64_t *)fw_cfg_addr;
+	volatile uint32_t * fw_cfg_32   = (volatile uint32_t *)fw_cfg_addr;
+	volatile uint16_t * fw_cfg_sel  = (volatile uint16_t *)(fw_cfg_addr + 8);
+
+	*fw_cfg_sel = 0;
+
+	uint64_t response = fw_cfg_data[0];
+	(void)response;
+
+	/* Needs to be big-endian */
+	*fw_cfg_sel = swizzle16(0x19);
+
+	/* count response is 32-bit BE */
+	uint32_t count = swizzle(fw_cfg_32[0]);
+
+	struct fw_cfg_file {
+		uint32_t size;
+		uint16_t select;
+		uint16_t reserved;
+		char name[56];
+	};
+
+	struct fw_cfg_file file;
+	uint8_t * tmp = (uint8_t *)&file;
+
+	/* Read count entries */
+	for (unsigned int i = 0; i < count; ++i) {
+		for (unsigned int j = 0; j < sizeof(struct fw_cfg_file); ++j) {
+			tmp[j] = fw_cfg_addr[0];
+		}
+
+		file.size = swizzle(file.size);
+		file.select = swizzle16(file.select);
+
+		if (!strcmp(file.name,"etc/ramfb")) {
+			static volatile struct ramfbcfg tmp;
+			uintptr_t z = mmu_map_to_physical(NULL,(uint64_t)&tmp);
+
+			lfb_resolution_x = 1440;
+			lfb_resolution_y = 900;
+			lfb_resolution_s = lfb_resolution_x*4;
+			lfb_resolution_b = 32;
+			lfb_memsize = lfb_resolution_s * lfb_resolution_y;
+			uint64_t frames = lfb_memsize/4096;
+			if ((lfb_memsize/4096)*4096!=lfb_memsize) frames++;
+			uint64_t addr = mmu_allocate_n_frames(frames) << 12;
+			lfb_vid_memory = mmu_map_from_physical(addr);
+			/* Clear it while we're here */
+			memset(lfb_vid_memory, 0, lfb_memsize);
+
+			tmp.addr = swizzle64(addr);
+			tmp.width = swizzle(lfb_resolution_x);
+			tmp.height = swizzle(lfb_resolution_y);
+			tmp.flags = 0;
+			tmp.fourcc = swizzle(DRM_FORMAT_XRGB8888);
+			tmp.stride = swizzle(lfb_resolution_s);
+
+			static volatile struct fwcfg_dma {
+				volatile uint32_t control;
+				volatile uint32_t length;
+				volatile uint64_t address;
+			} dma __attribute__((aligned(4096)));
+
+			dma.control = swizzle((file.select << 16) | (1 << 3) | (1 << 4));
+			dma.length  = swizzle(sizeof(struct ramfbcfg));
+			dma.address = swizzle64(z);
+
+			asm volatile ("isb" ::: "memory");
+			fw_cfg_data[2] = swizzle64(mmu_map_to_physical(NULL,(uint64_t)&dma));
+			asm volatile ("isb" ::: "memory");
+			break;
+		}
+	}
+}
+
+
 void arch_framebuffer_initialize(void) {
 	/* I'm not sure we have any options here...
 	 * lfbvideo calls this expecting it to fill in information
 	 * on a preferred video mode; maybe dtb has that? */
+	if (args_present("ramfb")) {
+		ramfb_init();
+	}
 }
 
 char * _arch_args = NULL;

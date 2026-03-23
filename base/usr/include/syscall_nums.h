@@ -21,7 +21,7 @@
 #define SYS_ACCEPT 18
 #define SYS_LISTEN 19
 #define SYS_CONNECT 20
-#define SYS_MKPIPE 21
+/* 21 - unused, was mkpipe */
 #define SYS_DUP2 22
 #define SYS_GETUID 23
 #define SYS_SETUID 24
@@ -73,3 +73,18 @@
 #define SYS_SETGROUPS 70
 #define SYS_TIMES 71
 #define SYS_SETTIMEOFDAY 72
+#define SYS_SIGACTION 73
+#define SYS_SIGPENDING 74
+#define SYS_SIGPROCMASK 75
+#define SYS_SIGSUSPEND 76
+#define SYS_SIGWAIT 77
+#define SYS_GETSOCKNAME 78
+#define SYS_GETPEERNAME 79
+#define SYS_PREAD 80
+#define SYS_PWRITE 81
+#define SYS_RENAME 82
+#define SYS_FCNTL 83
+#define SYS_FCHMOD 84
+#define SYS_FCHOWN 85
+#define SYS_TRUNCATE 86
+#define SYS_FTRUNCATE 87

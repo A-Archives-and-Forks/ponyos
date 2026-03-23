@@ -44,9 +44,11 @@ static struct TT_Font * _tt_font = NULL;
 
 #define BUTTON_CLOSE 0
 #define BUTTON_MAXIMIZE 1
-#define ACTIVE   2
-#define INACTIVE 11
-static sprite_t * sprites[20];
+#define BUTTON_MINIMIZE 2
+#define BUTTON_UNMAXIMIZE 3
+#define ACTIVE   4
+#define INACTIVE 13
+static sprite_t * sprites[22];
 
 #define TEXT_OFFSET ((window->decorator_flags & DECOR_FLAG_TILED) ? 5 : 10)
 #define BUTTON_OFFSET ((window->decorator_flags & DECOR_FLAG_TILED) ? 5 : 0)
@@ -119,24 +121,7 @@ static int get_bounds_fancy(yutani_window_t * window, struct decor_bounds * boun
 	return 0;
 }
 
-static char * ellipsify(char * input, int font_size, struct TT_Font * font, int max_width, int * out_width) {
-	int len = strlen(input);
-	char * out = malloc(len + 4);
-	memcpy(out, input, len + 1);
-	int width;
-	tt_set_size(font, font_size);
-	while ((width = tt_string_width(font, out)) > max_width) {
-		len--;
-		out[len+0] = '.';
-		out[len+1] = '.';
-		out[len+2] = '.';
-		out[len+3] = '\0';
-	}
-
-	if (out_width) *out_width = width;
-
-	return out;
-}
+#define BUTTON_PAD 5
 
 static void render_decorations_fancy(yutani_window_t * window, gfx_context_t * ctx, char * title, int decors_active) {
 	int width = window->width;
@@ -219,7 +204,7 @@ static void render_decorations_fancy(yutani_window_t * window, gfx_context_t * c
 
 	uint32_t title_color = (decors_active == ACTIVE) ? ACTIVE_COLOR : INACTIVE_COLOR;
 
-	int buttons_width = (!(window->decorator_flags & DECOR_FLAG_NO_MAXIMIZE)) ? 50 : 28;
+	int buttons_width = (!(window->decorator_flags & DECOR_FLAG_NO_MAXIMIZE)) ? 72 : 28;
 	int usable_width = width - bounds.width - (2 * buttons_width + 10) * TOTAL_SCALE;
 
 	tt_set_size(_tt_font, 12 * TOTAL_SCALE);
@@ -227,7 +212,7 @@ static void render_decorations_fancy(yutani_window_t * window, gfx_context_t * c
 	if (title_width > usable_width) {
 		usable_width += buttons_width * TOTAL_SCALE;
 		if (usable_width > 0) {
-			char * tmp_title = ellipsify(title, 12 * TOTAL_SCALE, _tt_font, usable_width, &title_width);
+			char * tmp_title = tt_ellipsify(title, 12 * TOTAL_SCALE, _tt_font, usable_width, &title_width);
 			int title_offset = bounds.left_width + 10 * TOTAL_SCALE;
 			tt_draw_string(ctx, _tt_font, title_offset, (TEXT_OFFSET + 14) * TOTAL_SCALE, tmp_title, title_color);
 			free(tmp_title);
@@ -237,33 +222,67 @@ static void render_decorations_fancy(yutani_window_t * window, gfx_context_t * c
 		tt_draw_string(ctx, _tt_font, title_offset, (TEXT_OFFSET + 14) * TOTAL_SCALE, title, title_color);
 	}
 
+	uint32_t h_color = rgb(100,100,100);
+	uint32_t i_color = (decor_hover_window == window && decor_hover_button) ? ACTIVE_COLOR : title_color;
+
 	if (width + (BUTTON_OFFSET - 28) * TOTAL_SCALE > bounds.left_width) {
+		if (decor_hover_window == window && decor_hover_button == DECOR_CLOSE) {
+			draw_rounded_rectangle(ctx,
+				width + (BUTTON_OFFSET - 28 - BUTTON_PAD) * TOTAL_SCALE,
+				(16 - BUTTON_OFFSET - BUTTON_PAD) * TOTAL_SCALE, 8 + BUTTON_PAD * 2, 8 + BUTTON_PAD * 2, 4, h_color);
+		}
 		draw_sprite_alpha_paint(ctx, sprites[BUTTON_CLOSE],
 			width + (BUTTON_OFFSET - 28) * TOTAL_SCALE,
-			(16 - BUTTON_OFFSET) * TOTAL_SCALE, 1.0, title_color);
+			(16 - BUTTON_OFFSET) * TOTAL_SCALE, 1.0, i_color);
 
 		if (width + (BUTTON_OFFSET - 50) * TOTAL_SCALE > bounds.left_width) {
 			if (!(window->decorator_flags & DECOR_FLAG_NO_MAXIMIZE)) {
-				draw_sprite_alpha_paint(ctx, sprites[BUTTON_MAXIMIZE],
+				if (decor_hover_window == window && decor_hover_button == DECOR_MAXIMIZE) {
+					draw_rounded_rectangle(ctx,
+						width + (BUTTON_OFFSET - 50 - BUTTON_PAD) * TOTAL_SCALE,
+						(16 - BUTTON_OFFSET - BUTTON_PAD) * TOTAL_SCALE, 8 + BUTTON_PAD * 2, 8 + BUTTON_PAD * 2, 4, h_color);
+				}
+				draw_sprite_alpha_paint(ctx, sprites[(window->decorator_flags & DECOR_FLAG_TILED) ? BUTTON_UNMAXIMIZE : BUTTON_MAXIMIZE],
 					width + (BUTTON_OFFSET - 50) * TOTAL_SCALE,
-					(16 - BUTTON_OFFSET) * TOTAL_SCALE, 1.0, title_color);
+					(16 - BUTTON_OFFSET) * TOTAL_SCALE, 1.0, i_color);
+
+				if (width + (BUTTON_OFFSET - 72) * TOTAL_SCALE > bounds.left_width) {
+					if (decor_hover_window == window && decor_hover_button == DECOR_MINIMIZE) {
+						draw_rounded_rectangle(ctx,
+							width + (BUTTON_OFFSET - 72 - BUTTON_PAD) * TOTAL_SCALE,
+							(16 - BUTTON_OFFSET - BUTTON_PAD) * TOTAL_SCALE, 8 + BUTTON_PAD * 2, 8 + BUTTON_PAD * 2, 4, h_color);
+					}
+					draw_sprite_alpha_paint(ctx, sprites[BUTTON_MINIMIZE],
+						width + (BUTTON_OFFSET - 72) * TOTAL_SCALE,
+						(16 - BUTTON_OFFSET) * TOTAL_SCALE, 1.0, i_color);
+				}
 			}
 		}
 	}
 }
 
 static int check_button_press_fancy(yutani_window_t * window, int x, int y) {
-	if (x >= (int)window->width + (BUTTON_OFFSET - 28) * TOTAL_SCALE &&
-		x <= (int)window->width + (BUTTON_OFFSET - 18) * TOTAL_SCALE &&
-		y >= 16 * TOTAL_SCALE && y <= 26 * TOTAL_SCALE ) {
-		return DECOR_CLOSE;
-	}
+	if (y >= (16 - BUTTON_OFFSET - BUTTON_PAD) * TOTAL_SCALE && y <= (16 - BUTTON_OFFSET + 8 + BUTTON_PAD) * TOTAL_SCALE ) {
+		if (x >= (int)window->width + (BUTTON_OFFSET - 28 - BUTTON_PAD) * TOTAL_SCALE &&
+			x <= (int)window->width + (BUTTON_OFFSET - 28 + 8 + BUTTON_PAD) * TOTAL_SCALE) {
+			return DECOR_CLOSE;
+		}
 
-	if (!(window->decorator_flags & DECOR_FLAG_NO_MAXIMIZE)) {
-		if (x >= (int)window->width + (BUTTON_OFFSET - 50) * TOTAL_SCALE &&
-			x <= (int)window->width + (BUTTON_OFFSET - 40) * TOTAL_SCALE &&
-			y >= 16 * TOTAL_SCALE && y <= 26 * TOTAL_SCALE) {
-			return DECOR_MAXIMIZE;
+		if (!(window->decorator_flags & DECOR_FLAG_NO_MAXIMIZE)) {
+			if (x >= (int)window->width + (BUTTON_OFFSET - 50 - BUTTON_PAD) * TOTAL_SCALE &&
+				x <= (int)window->width + (BUTTON_OFFSET - 50 + 8 + BUTTON_PAD) * TOTAL_SCALE) {
+				return DECOR_MAXIMIZE;
+			}
+
+			if (x >= (int)window->width + (BUTTON_OFFSET - 72 - BUTTON_PAD) * TOTAL_SCALE &&
+				x <= (int)window->width + (BUTTON_OFFSET - 72 + 8 + BUTTON_PAD) * TOTAL_SCALE) {
+				return DECOR_MINIMIZE;
+			}
+		}
+
+		if (x >= (int)window->width + (BUTTON_OFFSET - 72 - BUTTON_PAD) * TOTAL_SCALE &&
+			x <= (int)window->width + (BUTTON_OFFSET - 28 + 8 + BUTTON_PAD) * TOTAL_SCALE) {
+			return DECOR_OTHER;
 		}
 	}
 
@@ -273,6 +292,8 @@ static int check_button_press_fancy(yutani_window_t * window, int x, int y) {
 void decor_init() {
 	init_sprite(BUTTON_CLOSE, TTK_FANCY_PATH "button-close.png");
 	init_sprite(BUTTON_MAXIMIZE, TTK_FANCY_PATH "button-maximize.png");
+	init_sprite(BUTTON_MINIMIZE, TTK_FANCY_PATH "button-minimize.png");
+	init_sprite(BUTTON_UNMAXIMIZE, TTK_FANCY_PATH "button-unmaximize.png");
 
 	create_borders_from_spritesheet(ACTIVE, TTK_FANCY_PATH "borders-active.png");
 	create_borders_from_spritesheet(INACTIVE, TTK_FANCY_PATH "borders-inactive.png");

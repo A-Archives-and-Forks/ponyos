@@ -9,6 +9,7 @@
  * Copyright (C) 2018 K. Lange
  */
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -26,7 +27,10 @@ static int is_arg = 0;
 static uint64_t count_thing(char * tmp);
 
 static int print_human_readable_size(char * _out, size_t s) {
-	if (s >= 1<<20) {
+	if (s >= 1<<30) {
+		size_t t = s / (1 << 30);
+		return sprintf(_out, "%d.%1dG", (int)t, (int)(s - t * (1 << 30)) / ((1 << 30) / 10));
+	} else if (s >= 1<<20) {
 		size_t t = s / (1 << 20);
 		return sprintf(_out, "%d.%1dM", (int)t, (int)(s - t * (1 << 20)) / ((1 << 20) / 10));
 	} else if (s >= 1<<10) {
@@ -110,7 +114,7 @@ int main(int argc, char * argv[]) {
 				all = 0;
 				break;
 			default:
-				fprintf(stderr, "rm: unrecognized option '%c'\n", opt);
+				fprintf(stderr, "%s: unrecognized option '%c'\n", argv[0], opt);
 				break;
 		}
 	}

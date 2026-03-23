@@ -4,7 +4,7 @@
  * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2021 K. Lange
+ * Copyright (C) 2021-2022 K. Lange
  */
 #include <fcntl.h>
 #include <stdint.h>
@@ -17,9 +17,11 @@
 #include <termios.h>
 #include <poll.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <sys/signal.h>
 
 #include <sys/sysfunc.h>
 #include <toaru/list.h>
@@ -36,7 +38,8 @@ enum header_columns {
 	COLUMN_SHM,
 	COLUMN_MEM,
 	COLUMN_CPUA,
-	COLUMN_CPU
+	COLUMN_CPU,
+	COLUMN_S
 };
 
 static hashmap_t * process_ents = NULL;
@@ -66,6 +69,7 @@ struct process {
 	char * user;
 	char * process;
 	char * command_line;
+	char * state;
 };
 
 struct columns {
@@ -84,9 +88,10 @@ struct columns {
 	[COLUMN_CPU]  = {"%CPU", offsetof(struct process, cpu),  FORMATTER_PERCENT, 0, SORT_DEC},
 	[COLUMN_CPUA] = {"CPUA", offsetof(struct process, cpua), FORMATTER_PERCENT, 0, SORT_DEC},
 	[COLUMN_USER] = {"USER", offsetof(struct process, user), FORMATTER_STRING,  0, SORT_ASC},
+	[COLUMN_S]    = {"S",    offsetof(struct process, state),FORMATTER_STRING,  0, SORT_ASC},
 };
 
-static int columns[] = { COLUMN_PID, COLUMN_USER, COLUMN_VSZ, COLUMN_SHM, COLUMN_CPU, COLUMN_CPUA, COLUMN_MEM, COLUMN_NONE };
+static int columns[] = { COLUMN_PID, COLUMN_USER, COLUMN_VSZ, COLUMN_SHM, COLUMN_S, COLUMN_CPU, COLUMN_CPUA, COLUMN_MEM, COLUMN_NONE };
 
 /**
  * @brief Print a single column to stdout with the appropriate formatter.
@@ -204,6 +209,7 @@ void free_entry(struct process * out) {
 	if (out->command_line) free(out->command_line);
 	if (out->process) free(out->process);
 	if (out->user) free(out->user);
+	if (out->state) free(out->state);
 	free(out);
 }
 
@@ -250,6 +256,7 @@ struct process * process_entry(struct dirent *dent) {
 
 	int pid = 0, uid = 0, tgid = 0, mem = 0, shm = 0, vsz = 0, cpu = 0, cpua = 0;
 	char name[100];
+	char state[10];
 
 	sprintf(tmp, "/proc/%s/status", dent->d_name);
 	f = fopen(tmp, "r");
@@ -270,6 +277,8 @@ struct process * process_entry(struct dirent *dent) {
 		}
 		if (strstr(line, "Pid:") == line) {
 			pid = atoi(tab);
+		} else if (strstr(line, "State:") == line) {
+			strcpy(state, tab);
 		} else if (strstr(line, "Uid:") == line) {
 			uid = atoi(tab);
 		} else if (strstr(line, "Tgid:") == line) {
@@ -314,6 +323,7 @@ struct process * process_entry(struct dirent *dent) {
 	out->cpu = cpu;
 	out->cpua = cpua;
 	out->process = strdup(name);
+	out->state = strdup(state);
 	out->command_line = NULL;
 	out->user = format_username(out->uid);
 
@@ -511,9 +521,22 @@ static void next_sort_order(void) {
 }
 
 /**
- * @brief Gather and display one round of data.
+ * @brief Switch sorting to the previous column.
  */
-static int do_once(void) {
+static void prev_sort_order(void) {
+	size_t column_count = sizeof(columns)/sizeof(*columns);
+	for (size_t i = 0; i < column_count; ++i) {
+		if (columns[i] == sort_column) {
+			sort_column = columns[(i + column_count - 1) % column_count];
+			return;
+		}
+	}
+}
+
+/**
+ * @brief Collect information on running processes.
+ */
+static struct process ** read_processes(size_t * count) {
 	/* Set minimum column widths to titles */
 	reset_column_widths();
 
@@ -536,9 +559,12 @@ static int do_once(void) {
 	}
 	closedir(dirp);
 
+	hashmap_free(process_ents);
+	free(process_ents);
+
 	/* Turn list into an array */
-	size_t count = ents_list->length;
-	struct process ** processList = malloc(sizeof(struct process*) * count);
+	*count = ents_list->length;
+	struct process ** processList = malloc(sizeof(struct process*) * *count);
 	size_t ent = 0;
 	while (ents_list->length) {
 		node_t * node = list_pop(ents_list);
@@ -549,7 +575,17 @@ static int do_once(void) {
 	free(ents_list);
 
 	/* Sort processes with the current sort column */
-	qsort(processList, count, sizeof(struct process*), sort_processes);
+	qsort(processList, *count, sizeof(struct process*), sort_processes);
+
+	return processList;
+}
+
+/**
+ * @brief Gather system information and print one sample.
+ */
+static int do_once(void) {
+	size_t count;
+	struct process ** processList = read_processes(&count);
 
 	/* Gather total memory usage /proc/meminfo */
 	int mem_total = 0, mem_used = 0;
@@ -564,7 +600,7 @@ static int do_once(void) {
 
 	/* Gather screen size */
 	struct winsize w;
-	ioctl(STDERR_FILENO, TIOCGWINSZ, &w);
+	ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
 
 	/* Figure out how we're going to lay out widgets */
 	int top_rows = 1 + cpu_count;
@@ -645,6 +681,7 @@ static int do_once(void) {
 	/* Show column headers */
 	print_header();
 	int i = 0;
+	size_t ent = 0;
 
 	/* Print entries, or help text lines */
 	if (show_help) {
@@ -669,8 +706,6 @@ static int do_once(void) {
 		free_entry(processList[ent]);
 	}
 	free(processList);
-	hashmap_free(process_ents);
-	free(process_ents);
 
 	/* Wait for command or 2 seconds for next refresh... */
 	struct pollfd fds[1];
@@ -681,10 +716,79 @@ static int do_once(void) {
 		int c = fgetc(stdin);
 		if (c == 'q') return 0;
 		if (c == 'w') next_sort_order();
+		if (c == 'W') prev_sort_order();
 		if (c == 'h') show_help = !show_help;
 	}
 
 	return 1;
+}
+
+/**
+ * @brief Gather and print process information once.
+ *
+ * Prints only process information.
+ */
+static int do_log(void) {
+	size_t count;
+	struct process ** processList = read_processes(&count);
+
+	int mem_total = 0, mem_used = 0;
+	get_mem_info(&mem_total, &mem_used);
+
+	size_t mem_tmpfs = 0;
+	get_tmpfs_info(&mem_tmpfs);
+
+	/* Gather per-CPU usage from /proc/idle */
+	int cpus[32];
+	get_cpu_info(cpus);
+
+	/* Hostname */
+	{
+		char tmp[256] = {0};
+		gethostname(tmp, 255);
+		printf("Hostname: %s\n", tmp);
+	}
+
+	/* Current time */
+	{
+		char tmp[256] = {0};
+		char * format = "%a %b %d %T %Y %Z";
+		struct tm * timeinfo;
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		timeinfo = localtime((time_t *)&now.tv_sec);
+		strftime(tmp,255,format,timeinfo);
+		printf("Time: %s\n", tmp);
+	}
+
+	/* Task count and memory usage on one line */
+	printf("Tasks: %-7lu Mem: %dM/%dM (%ldM tmpfs)\n", count, mem_used / 1024, mem_total / 1024, mem_tmpfs/1024);
+
+	/* CPU usage; all on one line; formatted best for small counts and <100% usage */
+	for (int cpu = 0; cpu < cpu_count; ++cpu) {
+		printf("CPU%2d:%3d.%01d%%%s", cpu + 1, cpus[cpu] / 10, cpus[cpu] % 10,
+			(cpu + 1 == cpu_count) ? "\n" : "   ");
+	}
+
+	/* Blank line to separator process table */
+	printf("\n");
+
+	for (int * c = columns; *c; ++c) {
+		printf("%*s ", ColumnDescriptions[*c].width, ColumnDescriptions[*c].title);
+	}
+	printf("CMD\n");
+
+	for (size_t ent = 0; ent < count; ++ent) {
+		struct process * out = processList[ent];
+		for (int * c = columns; *c; ++c) {
+			print_column(out, *c);
+		}
+		printf("%s\n", out->command_line ? out->command_line : out->process);
+		free(out);
+	}
+	free(processList);
+
+	return 0;
 }
 
 struct termios old;
@@ -711,13 +815,27 @@ void set_buffered(void) {
 	tcsetattr(STDOUT_FILENO, TCSAFLUSH, &old);
 }
 
+void SIGWINCH_handler(int sig) {
+	(void)sig;
+	signal(SIGWINCH, SIGWINCH_handler);
+}
+
 int main (int argc, char * argv[]) {
 	/* Assume CPU count doesn't change... */
 	cpu_count = sysfunc(TOARU_SYS_FUNC_NPROC, NULL);
 
+	/*
+	 * If we are writing to a regular file, use the simple log format and
+	 * only output one sample of data before exiting.
+	 */
+	if (!isatty(STDOUT_FILENO)) {
+		return do_log();
+	}
+
 	/* Initialize terminal for alt screen */
 	get_initial_termios();
 	set_unbuffered();
+	signal(SIGWINCH, SIGWINCH_handler);
 
 	/* Loop */
 	while (do_once());

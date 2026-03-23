@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 struct device_class {
 	uint16_t id;
@@ -88,8 +90,9 @@ struct {
 	{0x1912, 0x0015, "uPD720202 USB 3.0 Host Controller"},
 
 	/* Red Hat */
-	{0x1af4, 0x1000, "virtio-net"},
-	{0x1af4, 0x1052, "virtio-input"},
+	{0x1af4, 0x1000, "Virtio Network Device"},
+	{0x1af4, 0x1052, "Virtio Input Device"},
+	{0x1b36, 0x0008, "QEMU PCIe Host Bridge"},
 	{0x1b36, 0x000d, "QEMU XHCI Host Controller"},
 
 	/* Intel */

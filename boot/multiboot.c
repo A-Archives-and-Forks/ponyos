@@ -59,16 +59,30 @@ static uintptr_t ramdisk_off = 0;
 static uintptr_t ramdisk_len = 0;
 uintptr_t final_offset = 0;
 uintptr_t _xmain = 0;
+int disable_kaslr = 0;
+
+static inline uint64_t read_tsc(void) {
+	uint32_t lo, hi;
+	asm volatile ( "rdtsc" : "=a"(lo), "=d"(hi) );
+	return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
 
 static int load_aout(uint32_t * hdr) {
 	uintptr_t base_offset = (uintptr_t)hdr - (uintptr_t)kernel_load_start;
 	uintptr_t hdr_offset  = hdr[3] - base_offset;
+	uint32_t  rando = 0;
+	size_t    xtra = 0;
 
-	memcpy((void*)(uintptr_t)hdr[4], kernel_load_start + (hdr[4] - hdr_offset), (hdr[5] - hdr[4]));
-	memset((void*)(uintptr_t)hdr[5], 0, (hdr[6] - hdr[5]));
-	_xmain = (uintptr_t)hdr[7];
+	if (!disable_kaslr) {
+		asm volatile ( "rdtsc" : "=a"(rando), "=d"((uint32_t){0}) );
+		xtra = (rando & 0xFF) << 12;
+	}
 
-	if (hdr[6] > final_offset) final_offset = hdr[6];
+	memcpy((void*)(uintptr_t)hdr[4] + xtra, kernel_load_start + (hdr[4] - hdr_offset), (hdr[5] - hdr[4]));
+	memset((void*)(uintptr_t)hdr[5] + xtra, 0, (hdr[6] - hdr[5]));
+	_xmain = (uintptr_t)hdr[7] + xtra;
+
+	if (hdr[6] + xtra > final_offset) final_offset = hdr[6] + xtra;
 	final_offset = (final_offset & ~(0xFFF)) + ((final_offset & 0xFFF) ? 0x1000 : 0);
 
 	return 1;
@@ -264,39 +278,9 @@ static void finish_boot(void) {
 		}
 	}
 
-	uint64_t foobar = ((uint32_t)(uintptr_t)&do_the_nasty) | (0x10L << 32L);
-
-	uint32_t * foo = (uint32_t *)0x7c00;
-
-	foo[0] = MULTIBOOT_EAX_MAGIC;
-	foo[1] = (uintptr_t)finalHeader;
-	foo[2] = _xmain;
-
+	/* Jump to entry with register arguments */
 	__asm__ __volatile__ (
-			"push %0\n"
-			"lretl\n"
-			 : : "g"(foobar));
-
-	__asm__ (
-		"do_the_nasty:\n"
-		"cli\n"
-		".code32\n"
-		"mov %cr0, %eax\n"
-		"and $0x7FFeFFFF, %eax\n"
-		"mov %eax, %cr0\n"
-		"mov $0xc0000080, %ecx\n"
-		"rdmsr\n"
-		"and $0xfffffeff, %eax\n"
-		"wrmsr\n"
-		"mov $0x640, %eax\n"
-		"mov %eax, %cr4\n"
-		"mov 0x7c00, %eax\n"
-		"mov 0x7c04, %ebx\n"
-		"mov 0x7c08, %ecx\n"
-		"jmp *%ecx\n"
-		"target: jmp target\n"
-		".code64\n"
-		);
+		"jmp %0" :: "r"(_xmain), "a"(MULTIBOOT_EAX_MAGIC), "b"(finalHeader));
 
 	__builtin_unreachable();
 }
@@ -316,8 +300,16 @@ void boot(void) {
 	draw_logo(0);
 
 	for (unsigned int i = 0; i < ST->NumberOfTableEntries; ++i) {
+		/* ACPI 1 table pointer. */
 		if (ST->ConfigurationTable[i].VendorGuid.Data1 == 0xeb9d2d30 &&
 			ST->ConfigurationTable[i].VendorGuid.Data2 == 0x2d88 &&
+			ST->ConfigurationTable[i].VendorGuid.Data3 == 0x11d3) {
+			multiboot_header.config_table = (uintptr_t)ST->ConfigurationTable[i].VendorTable & 0xFFFFffff;
+			break;
+		}
+		/* ACPI 2 table pointer. */
+		if (ST->ConfigurationTable[i].VendorGuid.Data1 == 0x8868e871 &&
+			ST->ConfigurationTable[i].VendorGuid.Data2 == 0xe4f1 &&
 			ST->ConfigurationTable[i].VendorGuid.Data3 == 0x11d3) {
 			multiboot_header.config_table = (uintptr_t)ST->ConfigurationTable[i].VendorTable & 0xFFFFffff;
 			break;

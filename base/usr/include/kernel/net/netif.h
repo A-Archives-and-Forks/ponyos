@@ -27,15 +27,32 @@ typedef struct SockData {
 	void (*sock_close)(struct SockData * sock);
 	long (*sock_connect)(struct SockData * sock, const struct sockaddr *addr, socklen_t addrlen);
 	long (*sock_bind)(struct SockData * sock, const struct sockaddr *addr, socklen_t addrlen);
+	long (*sock_getsockname)(struct SockData * sock, struct sockaddr *addr, socklen_t *addrlen);
+	long (*sock_getpeername)(struct SockData * sock, struct sockaddr *addr, socklen_t *addrlen);
 
 	struct sockaddr dest;
 	uint32_t priv32[4];
 
 	size_t unread;
 	char * buf;
+	int nonblocking;
 } sock_t;
 
 void net_sock_alert(sock_t * sock);
 void net_sock_add(sock_t * sock, void * frame, size_t size);
 void * net_sock_get(sock_t * sock);
 sock_t * net_sock_create(void);
+
+extern long net_socket(int,int,int);
+extern long net_setsockopt(int,int,int,const void*,socklen_t);
+extern long net_bind(int, const struct sockaddr*, socklen_t);
+extern long net_accept(int, struct sockaddr*, socklen_t*);
+extern long net_listen(int,int);
+extern long net_connect(int, const struct sockaddr*, socklen_t);
+extern long net_getsockopt(int,int,int,void*,socklen_t*);
+extern long net_recv(int,struct msghdr*,int);
+extern long net_send(int, const struct msghdr*, int);
+extern long net_shutdown(int, int);
+extern long net_getsockname(int,struct sockaddr*,socklen_t*);
+extern long net_getpeername(int,struct sockaddr*,socklen_t*);
+

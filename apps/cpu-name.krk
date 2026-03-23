@@ -24,10 +24,13 @@ if cpus and 'Model name' in cpus[0]:
 else if cpus and 'PartNum' in cpus[0]:
     # ARM
     let manuf = {
+        0x00: 'Masked',
         0x41: 'ARM',
         0x61: 'Apple',
     }
     let parts = {
+        0x000: 'by hypervisor',
+
         0xD02: 'Cortex-A34',
         0xD03: 'Cortex-A53',
         0xD04: 'Cortex-A35',
@@ -41,6 +44,6 @@ else if cpus and 'PartNum' in cpus[0]:
         0x023: 'M1', # Firestorm core
     }
     print(
-        manuf.get(int(cpus[0]['Implementer']),cpus[0]['Implementer']),
-        parts.get(int(cpus[0]['PartNum']),cpus[0]['PartNum'])
+        manuf.get(int(cpus[0]['Implementer'],0),cpus[0]['Implementer']),
+        parts.get(int(cpus[0]['PartNum'],0),cpus[0]['PartNum'])
     )

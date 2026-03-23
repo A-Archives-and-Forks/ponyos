@@ -35,6 +35,8 @@
 #define HILIGHT_GRADIENT_BOTTOM rgb(150,0,134)
 #define HILIGHT_BORDER_BOTTOM rgb(201,73,187)
 
+#define MENU_ENTRY_FLAGS_DISABLED 0x0001
+
 static hashmap_t * menu_windows = NULL;
 static yutani_t * my_yctx = NULL;
 
@@ -60,13 +62,15 @@ static int draw_string(gfx_context_t * ctx, int x, int y, uint32_t color, const 
 	return markup_draw_string(ctx,x,y+13,s,color);
 }
 
+static int _menu_is_disabled(struct MenuEntry * entry);
+
 void _menu_draw_MenuEntry_Normal(gfx_context_t * ctx, struct MenuEntry * self, int offset) {
 	struct MenuEntry_Normal * _self = (struct MenuEntry_Normal *)self;
 
 	_self->offset = offset;
 
 	/* Background gradient */
-	if (_self->hilight) {
+	if (!_menu_is_disabled(self) && _self->hilight) {
 		draw_line(ctx, 1, _self->width-2, offset, offset, HILIGHT_BORDER_TOP);
 		draw_line(ctx, 1, _self->width-2, offset + _self->height - 1, offset + _self->height - 1, HILIGHT_BORDER_BOTTOM);
 		for (int i = 1; i < self->height-1; ++i) {
@@ -82,14 +86,22 @@ void _menu_draw_MenuEntry_Normal(gfx_context_t * ctx, struct MenuEntry * self, i
 	if (_self->icon) {
 		sprite_t * icon = icon_get_16(_self->icon);
 		if (icon->width == MENU_ICON_SIZE) {
-			draw_sprite(ctx, icon, 4, offset + 2);
+			if (_menu_is_disabled(self)) {
+				draw_sprite_alpha(ctx, icon, 4, offset + 2, 0.5);
+			} else {
+				draw_sprite(ctx, icon, 4, offset + 2);
+			}
 		} else {
-			draw_sprite_scaled(ctx, icon, 4, offset + 2, MENU_ICON_SIZE, MENU_ICON_SIZE);
+			if (_menu_is_disabled(self)) {
+				draw_sprite_scaled_alpha(ctx, icon, 4, offset + 2, MENU_ICON_SIZE, MENU_ICON_SIZE, 0.5);
+			} else {
+				draw_sprite_scaled(ctx, icon, 4, offset + 2, MENU_ICON_SIZE, MENU_ICON_SIZE);
+			}
 		}
 	}
 
 	/* Foreground text color */
-	uint32_t color = _self->hilight ? rgb(255,255,255) : rgb(0,0,0);
+	uint32_t color = _menu_is_disabled(self) ? rgba(0,0,0,127) : (_self->hilight ? rgb(255,255,255) : rgb(0,0,0));
 
 	/* Draw title */
 	draw_string(ctx, 22, offset + 1, color, _self->title);
@@ -106,6 +118,8 @@ void _menu_focus_MenuEntry_Normal(struct MenuEntry * self, int focused) {
 
 void _menu_activate_MenuEntry_Normal(struct MenuEntry * self, int flags) {
 	struct MenuEntry_Normal * _self = (struct MenuEntry_Normal *)self;
+
+	if (_menu_is_disabled(self)) return; /* Do nothing */
 
 	list_t * menu_keys = hashmap_keys(menu_windows);
 	hovered_menu = NULL;
@@ -136,7 +150,7 @@ static struct MenuEntryVTable _menu_vtable_MenuEntry_Normal = {
 };
 
 struct MenuEntry * menu_create_normal(const char * icon, const char * action, const char * title, void (*callback)(struct MenuEntry *)) {
-	struct MenuEntry_Normal * out = malloc(sizeof(struct MenuEntry_Normal));
+	struct MenuEntry_Normal * out = calloc(1,sizeof(struct MenuEntry_Normal));
 
 	out->_type = MenuEntry_Normal;
 	out->height = MENU_ENTRY_HEIGHT;
@@ -152,17 +166,48 @@ struct MenuEntry * menu_create_normal(const char * icon, const char * action, co
 	return (struct MenuEntry *)out;
 }
 
+void _menu_draw_MenuEntry_Toggle(gfx_context_t * ctx, struct MenuEntry * self, int offset) {
+	_menu_draw_MenuEntry_Normal(ctx,self,offset);
+	struct MenuEntry_Toggle * _self = (struct MenuEntry_Toggle *)self;
+
+	if (_self->set) {
+		sprite_t * check_box = icon_get_16("check");
+		uint32_t color = _menu_is_disabled(self) ? rgba(0,0,0,127) : (_self->hilight ? rgb(255,255,255) : rgb(0,0,0));
+		draw_sprite_alpha_paint(ctx, check_box, 4, offset + 2, 1.0, color);
+	}
+}
+static struct MenuEntryVTable _menu_vtable_MenuEntry_Toggle = {
+	.methods = 3,
+	.renderer = _menu_draw_MenuEntry_Toggle, /* Only the renderer differs; users must manage toggle state */
+	.focus_change = _menu_focus_MenuEntry_Normal,
+	.activate = _menu_activate_MenuEntry_Normal,
+};
+
+struct MenuEntry * menu_create_toggle(const char * action, const char * title, int set, void (*callback)(struct MenuEntry *)) {
+	/* Reuse the initializer for the normal one, assuming with no icon. */
+	struct MenuEntry_Toggle * out = (struct MenuEntry_Toggle*)menu_create_normal(NULL, action, title, callback);
+	if (!out) return out;
+	out = realloc(out, sizeof(struct MenuEntry_Toggle));
+
+	out->_type = MenuEntry_Toggle;
+	out->vtable = &_menu_vtable_MenuEntry_Toggle;
+
+	/* And just set our status */
+	out->set = set;
+	return out;
+}
+
 void _menu_draw_MenuEntry_Submenu(gfx_context_t * ctx, struct MenuEntry * self, int offset) {
 
 	struct MenuEntry_Submenu * _self = (struct MenuEntry_Submenu *)self;
 	int h = _self->hilight;
-	if (_self->_owner && _self->_my_child && _self->_owner->child == _self->_my_child) {
+	if (_self->_owner && _self->_my_child && _self->_owner->child == _self->_my_child && !_self->_my_child->closed) {
 		_self->hilight = 1;
 	}
 	_menu_draw_MenuEntry_Normal(ctx,self,offset);
 
 	/* Draw the tick on the right side to indicate this is a submenu */
-	uint32_t color = _self->hilight ? rgb(255,255,255) : rgb(0,0,0);
+	uint32_t color = _menu_is_disabled(self) ? rgba(0,0,0,127) : (_self->hilight ? rgb(255,255,255) : rgb(0,0,0));
 	sprite_t * tick = icon_get_16("menu-tick");
 	draw_sprite_alpha_paint(ctx, tick, _self->width - 16, offset + 2, 1.0, color);
 	_self->hilight = h;
@@ -177,6 +222,8 @@ void _menu_focus_MenuEntry_Submenu(struct MenuEntry * self, int focused) {
 void _menu_activate_MenuEntry_Submenu(struct MenuEntry * self, int focused) {
 	struct MenuEntry_Submenu * _self = (struct MenuEntry_Submenu *)self;
 
+	if (_menu_is_disabled(self)) return; /* Do nothing */
+
 	if (_self->_owner && _self->_owner->set) {
 		/* Show a menu */
 		struct MenuList * new_menu = menu_set_get_menu(_self->_owner->set, (char *)_self->action);
@@ -188,6 +235,7 @@ void _menu_activate_MenuEntry_Submenu(struct MenuEntry * self, int focused) {
 		new_menu->parent->child = new_menu;
 		_self->_my_child = new_menu;
 		if (new_menu->closed) {
+			new_menu->main_window = new_menu->parent->main_window;
 			menu_prepare(new_menu, _self->_owner->window->ctx);
 			int offset_x = _self->_owner->window->width - 2;
 			if (_self->_owner->window->width + _self->_owner->window->x - 2 + new_menu->window->width > _self->_owner->window->ctx->display_width) {
@@ -209,7 +257,7 @@ static struct MenuEntryVTable _menu_vtable_MenuEntry_Submenu = {
 };
 
 struct MenuEntry * menu_create_submenu(const char * icon, const char * action, const char * title) {
-	struct MenuEntry_Submenu * out = malloc(sizeof(struct MenuEntry_Submenu));
+	struct MenuEntry_Submenu * out = calloc(1,sizeof(struct MenuEntry_Submenu));
 
 	out->_type = MenuEntry_Submenu;
 	out->height = MENU_ENTRY_HEIGHT;
@@ -251,7 +299,7 @@ static struct MenuEntryVTable _menu_vtable_MenuEntry_Separator = {
 };
 
 struct MenuEntry * menu_create_separator(void) {
-	struct MenuEntry_Separator * out = malloc(sizeof(struct MenuEntry_Separator));
+	struct MenuEntry_Separator * out = calloc(1,sizeof(struct MenuEntry_Separator));
 
 	out->_type = MenuEntry_Separator;
 	out->height = 6;
@@ -283,16 +331,39 @@ void menu_update_title(struct MenuEntry * self, char * new_title) {
 
 void menu_update_icon(struct MenuEntry * self, char * newIcon) {
 	switch (self->_type) {
+		case MenuEntry_Submenu:
 		case MenuEntry_Normal: {
 			struct MenuEntry_Normal * _self = (struct MenuEntry_Normal *)self;
 			if (_self->icon)   free(_self->icon);
 			_self->icon = newIcon ? strdup(newIcon) : NULL;
 			break;
 		}
-		case  MenuEntry_Submenu: {
-			struct MenuEntry_Submenu * _self = (struct MenuEntry_Submenu *)self;
-			if (_self->icon)   free(_self->icon);
-			_self->icon = newIcon ? strdup(newIcon) : NULL;
+		case MenuEntry_Toggle: /* Toggle should not be able to set icon */
+		default:
+			break;
+	}
+}
+
+void menu_update_toggle_state(struct MenuEntry * self, int state) {
+	switch (self->_type) {
+		case MenuEntry_Toggle: {
+			struct MenuEntry_Toggle * _self = (struct MenuEntry_Toggle *)self;
+			_self->set = state;
+			break;
+		}
+		default:
+			break;
+	}
+}
+
+void menu_update_enabled(struct MenuEntry * self, int state) {
+	switch (self->_type) {
+		case MenuEntry_Toggle:
+		case  MenuEntry_Submenu:
+		case MenuEntry_Normal: {
+			unsigned long flags = ((struct MenuEntry_Normal*)self)->flags & ~MENU_ENTRY_FLAGS_DISABLED;
+			if (!state) flags |= MENU_ENTRY_FLAGS_DISABLED;
+			((struct MenuEntry_Normal*)self)->flags = flags;
 			break;
 		}
 		default:
@@ -302,15 +373,10 @@ void menu_update_icon(struct MenuEntry * self, char * newIcon) {
 
 void menu_free_entry(struct MenuEntry * self) {
 	switch (self->_type) {
+		case MenuEntry_Toggle:
+		case  MenuEntry_Submenu:
 		case MenuEntry_Normal: {
 			struct MenuEntry_Normal * _self = (struct MenuEntry_Normal *)self;
-			if (_self->icon)   free(_self->icon);
-			if (_self->title)  free(_self->title);
-			if (_self->action) free(_self->action);
-			break;
-		}
-		case  MenuEntry_Submenu: {
-			struct MenuEntry_Submenu * _self = (struct MenuEntry_Submenu *)self;
 			if (_self->icon)   free(_self->icon);
 			if (_self->title)  free(_self->title);
 			if (_self->action) free(_self->action);
@@ -408,6 +474,7 @@ struct MenuList * menu_create(void) {
 	p->closed = 1;
 	p->flags = 0;
 	p->tail_offset = 0;
+	p->main_window = 0;
 	return p;
 }
 
@@ -592,8 +659,11 @@ void menu_prepare(struct MenuList * menu, yutani_t * yctx) {
 	/* Create window */
 
 	yutani_window_t * menu_window = yutani_window_create_flags(yctx, width, height,
-		((menu->flags & MENU_FLAG_BUBBLE) ? YUTANI_WINDOW_FLAG_ALT_ANIMATION :
-			YUTANI_WINDOW_FLAG_NO_ANIMATION) | YUTANI_WINDOW_FLAG_DISALLOW_DRAG | YUTANI_WINDOW_FLAG_DISALLOW_RESIZE);
+		((menu->flags & MENU_FLAG_BUBBLE) ? YUTANI_WINDOW_FLAG_ALT_ANIMATION : YUTANI_WINDOW_FLAG_NO_ANIMATION)
+		| YUTANI_WINDOW_FLAG_DISALLOW_DRAG
+		| YUTANI_WINDOW_FLAG_DISALLOW_RESIZE
+		| YUTANI_WINDOW_FLAG_PARENT_WID,
+		menu->main_window);
 	yutani_set_stack(yctx, menu_window, YUTANI_ZORDER_MENU);
 	if (menu->ctx) {
 		reinit_graphics_yutani(menu->ctx, menu_window);
@@ -609,13 +679,8 @@ void menu_prepare(struct MenuList * menu, yutani_t * yctx) {
 	hashmap_set(menu_windows, (void*)(uintptr_t)menu_window->wid, menu_window);
 }
 
-void menu_show(struct MenuList * menu, yutani_t * yctx) {
-	menu_prepare(menu, yctx);
-	yutani_flip(yctx, menu->window);
-}
-
 void menu_show_at(struct MenuList * menu, yutani_window_t * parent, int x, int y) {
-
+	menu->main_window = parent;
 	menu_prepare(menu, parent->ctx);
 
 	if (parent->x + x + menu->window->width > parent->ctx->display_width) x -= menu->window->width;
@@ -634,7 +699,6 @@ int menu_has_eventual_child(struct MenuList * root, struct MenuList * child) {
 
 	while (candidate && candidate != child) {
 		if (candidate == root->child) {
-			root->child = NULL;
 			return 1;
 		}
 		candidate = root->child;
@@ -663,6 +727,7 @@ int menu_definitely_close(struct MenuList * menu) {
 	yutani_wid_t wid = menu->window->wid;
 	yutani_close(menu->window->ctx, menu->window);
 	menu->window = NULL;
+	menu->main_window = NULL;
 	hashmap_remove(menu_windows, (void*)(uintptr_t)wid);
 
 	return 0;
@@ -701,6 +766,19 @@ int menu_leave(struct MenuList * menu) {
 	return 0;
 }
 
+static int _menu_is_disabled(struct MenuEntry * entry) {
+	switch (entry->_type) {
+		case MenuEntry_Toggle:
+		case MenuEntry_Submenu:
+		case MenuEntry_Normal:
+			return ((struct MenuEntry_Normal*)entry)->flags & MENU_ENTRY_FLAGS_DISABLED;
+		case MenuEntry_Separator:
+			return 1;
+		default:
+			return 0;
+	}
+}
+
 void menu_key_action(struct MenuList * menu, struct yutani_msg_key_event * me) {
 	if (me->event.action != KEY_ACTION_DOWN) return;
 
@@ -713,42 +791,37 @@ void menu_key_action(struct MenuList * menu, struct yutani_msg_key_event * me) {
 	struct MenuEntry * hilighted = NULL;
 	struct MenuEntry * previous = NULL;
 	struct MenuEntry * next = NULL;
-	int got_it = 0;
+	struct MenuEntry * first = NULL;
+	struct MenuEntry * last = NULL;
 	foreach(node, menu->entries) {
 		struct MenuEntry * entry = node->value;
-		if (entry->hilight) {
+		if (!first && !_menu_is_disabled(entry)) {
+			first = entry;
+		}
+		if (!hilighted && entry->hilight) {
 			hilighted = entry;
-			got_it = 1;
 			continue;
 		}
-		if (got_it) {
-			next = entry;
-			break;
+		if (!_menu_is_disabled(entry)) {
+			if (!next && hilighted) next = entry;
+			if (!hilighted) previous = entry;
+			last = entry;
 		}
-		previous = entry;
 	}
 
 	if (me->event.keycode == KEY_ARROW_DOWN) {
 		if (hilighted) {
 			hilighted->hilight = 0;
-			hilighted = next;
 		}
-		if (!hilighted) {
-			/* Use the first entry */
-			hilighted = menu->entries->head->value;
-		}
-		hilighted->hilight = 1;
+		hilighted = next ? next : first;
+		if (hilighted) hilighted->hilight = 1;
 		_menu_redraw(window,yctx,menu,1);
 	} else if (me->event.keycode == KEY_ARROW_UP) {
 		if (hilighted) {
 			hilighted->hilight = 0;
-			hilighted = previous;
 		}
-		if (!hilighted) {
-			/* Use the last entry */
-			hilighted = menu->entries->tail->value;
-		}
-		hilighted->hilight = 1;
+		hilighted = previous ? previous : last;
+		if (hilighted) hilighted->hilight = 1;
 		_menu_redraw(window,yctx,menu,1);
 	} else if (me->event.keycode == KEY_ARROW_RIGHT) {
 		if (!hilighted) {
@@ -949,16 +1022,20 @@ void menu_bar_render(struct menu_bar * self, gfx_context_t * ctx) {
 	int _x = self->x;
 	int _y = self->y;
 	int width = self->width;
+	int height = MENU_BAR_HEIGHT;
+
+	if (_x < 0) _x = 0;
+	if (_y < 0) _y = 0;
+	if (_x + width > ctx->width) width = ctx->width - _x;
+	if (_y + height > ctx->height) height = ctx->height - _y;
+
+	gfx_context_t * subctx = init_graphics_subregion(ctx, _x, _y, width, height);
 
 	uint32_t menu_bar_color = rgb(59,59,59);
-	for (int y = 0; y < MENU_BAR_HEIGHT; ++y) {
-		for (int x = 0; x < width; ++x) {
-			GFX(ctx, x+_x,y+_y) = menu_bar_color;
-		}
-	}
+	draw_rectangle(subctx, 0, 0, width, height, menu_bar_color);
 
 	/* for each menu entry */
-	int offset = _x;
+	int offset = 0;
 	struct menu_bar_entries * _entries = self->entries;
 
 	if (!self->num_entries) {
@@ -971,16 +1048,14 @@ void menu_bar_render(struct menu_bar * self, gfx_context_t * ctx) {
 	while (_entries->title) {
 		int w = string_width(_entries->title) + 11;
 		if ((self->active_menu && hashmap_has(menu_get_windows_hash(), (void*)(uintptr_t)self->active_menu_wid)) && _entries == self->active_entry) {
-			for (int y = _y; y < _y + MENU_BAR_HEIGHT; ++y) {
-				for (int x = offset + 2; x < offset + 2 + w; ++x) {
-					GFX(ctx, x, y) = HILIGHT_BORDER_BOTTOM;
-				}
-			}
+			draw_rectangle(subctx, offset + 2, 0, w, height, HILIGHT_BORDER_BOTTOM);
 		}
-		draw_string(ctx, offset + 7, _y + 2, 0xFFFFFFFF, _entries->title);
+		draw_string(subctx, offset + 7, 2, 0xFFFFFFFF, _entries->title);
 		offset += w;
 		_entries++;
 	}
+
+	free(subctx);
 }
 
 void menu_bar_show_menu(yutani_t * yctx, yutani_window_t * window, struct menu_bar * self, int offset, struct menu_bar_entries * _entries) {
@@ -1006,6 +1081,7 @@ void menu_bar_show_menu(yutani_t * yctx, yutani_window_t * window, struct menu_b
 		}
 	}
 
+	new_menu->main_window = window;
 	menu_prepare(new_menu, yctx);
 	yutani_window_move_relative(yctx, new_menu->window, window, offset, self->y + MENU_BAR_HEIGHT);
 	yutani_flip(yctx, new_menu->window);

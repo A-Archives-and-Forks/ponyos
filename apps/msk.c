@@ -187,6 +187,11 @@ static int update_stores(int argc, char * argv[]) {
 	confreader_t * manifest_out = confreader_create_empty();
 	hashmap_t * remotes = hashmap_get(msk_config->sections, "remotes");
 
+	if (!remotes) {
+		fprintf(stderr, "No remotes defined - bad msk.conf?\n");
+		return 1;
+	}
+
 	int one_success = 0;
 
 	char * order = strdup(confreader_getd(msk_config, "", "remote_order", ""));
@@ -269,6 +274,10 @@ static int list_contains(list_t * list, char * key) {
 }
 
 static int process_package(list_t * pkgs, char * name) {
+	if (!strlen(name)) {
+		fprintf(stderr, "invalid package name\n");
+		return 1;
+	}
 	if (hashmap_has(msk_installed, name)) return 0;
 	if (list_contains(pkgs, name)) return 0;
 
@@ -279,7 +288,7 @@ static int process_package(list_t * pkgs, char * name) {
 
 	/* Gather dependencies */
 	char * tmp  = confreader_get(msk_manifest, name, "dependencies");
-	if (strlen(tmp)) {
+	if (tmp && strlen(tmp)) {
 		char * deps = strdup(tmp);
 		char * save;
 		char * tok = strtok_r(deps, " ", &save);

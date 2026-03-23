@@ -7,8 +7,8 @@ _Begin_C_Header
 
 typedef int gid_t;
 typedef int uid_t;
-typedef int dev_t;
-typedef int ino_t;
+typedef unsigned long dev_t;
+typedef unsigned long ino_t;
 typedef int mode_t;
 typedef int caddr_t;
 
@@ -20,6 +20,9 @@ typedef unsigned long blkcnt_t;
 typedef long off_t;
 typedef long time_t;
 typedef long clock_t;
+
+#define __need_size_t
+#include <stddef.h>
 
 typedef long ssize_t;
 

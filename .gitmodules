@@ -10,3 +10,6 @@
 [submodule "base/usr/ponysay"]
 	path = base/usr/ponysay
 	url = https://github.com/klange/ponysay
+[submodule "bim"]
+	path = bim
+	url = ../bim

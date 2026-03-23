@@ -29,6 +29,8 @@ DEFN_SYSCALL5(getsockopt, SYS_GETSOCKOPT, int,int,int,void*,size_t*);
 DEFN_SYSCALL3(recv, SYS_RECV, int,void*,int);
 DEFN_SYSCALL3(send, SYS_SEND, int,const void*,int);
 DEFN_SYSCALL2(shutdown, SYS_SHUTDOWN, int, int);
+DEFN_SYSCALL3(getsockname, SYS_GETSOCKNAME, int,void*,size_t*);
+DEFN_SYSCALL3(getpeername, SYS_GETPEERNAME, int,void*,size_t*);
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 	__sets_errno(syscall_connect(sockfd,addr,addrlen));
@@ -157,13 +159,11 @@ int shutdown(int sockfd, int how) {
 #define UNIMPLEMENTED fprintf(stderr, "[libnetwork] Unimplemented: %s\n", __FUNCTION__)
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
-	UNIMPLEMENTED;
-	return -1;
+	__sets_errno(syscall_getsockname(sockfd, addr, addrlen));
 }
 
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
-	UNIMPLEMENTED;
-	return -1;
+	__sets_errno(syscall_getpeername(sockfd, addr, addrlen));
 }
 
 in_addr_t inet_addr(const char * in) {
@@ -210,7 +210,7 @@ char * inet_ntoa(struct in_addr in) {
 
 static struct hostent _hostent = {0};
 static uint32_t _hostent_addr = 0;
-static char * _host_entry_list[1] = {0};
+static char * _host_entry_list[2] = {0};
 
 struct dns_packet {
 	uint16_t qid;
@@ -358,16 +358,52 @@ struct hostent * gethostbyname(const char * name) {
 		return NULL;
 	}
 
-	/* Get a return value */
-	_hostent.h_name = (char*)name;
-	_hostent.h_aliases = NULL;
-	_hostent.h_addrtype = AF_INET;
-	_hostent.h_length = sizeof(uint32_t);
-	_hostent.h_addr_list = _host_entry_list;
-	_host_entry_list[0] = (char*)&_hostent_addr;
-	_hostent_addr = *(uint32_t*)(buf+len-4);
+	uint16_t answers = ntohs(response->answers);
+	uint16_t queries = ntohs(response->questions);
+	const unsigned char * d = response->data;
 
-	return &_hostent;
+	for (uint16_t i = 0; i < queries; ++i) {
+		while (1) {
+			if (d - response->data >= len) goto _nope;
+			int l = *d++;
+			if ((l & 0xc0) == 0xc0) { d++; break; }
+			if (!l) break;
+			d += l;
+		}
+		d += 4;
+	}
+	for (uint16_t i = 0; i < answers; ++i) {
+		while (1) {
+			if (d - response->data >= len) goto _nope;
+			int l = *d++;
+			if ((l & 0xc0) == 0xc0) { d++; break; }
+			if (!l) break;
+			d += l;
+		}
+
+		if (d - response->data > len + 10) goto _nope;
+		d += 2; /* skip type */
+		uint16_t cls  = d[0] * 256 + d[1]; d += 2;
+		d += 4; /* skip ttl */
+		uint16_t dlen = d[0] * 256 + d[1]; d += 2;
+		if (dlen == 4 && cls == 1) {
+			if (d - response->data > len + dlen) goto _nope;
+			/* Get a return value */
+			_hostent.h_name = (char*)name;
+			_hostent.h_aliases = NULL;
+			_hostent.h_addrtype = AF_INET;
+			_hostent.h_length = sizeof(uint32_t);
+			_hostent.h_addr_list = _host_entry_list;
+			_host_entry_list[0] = (char*)&_hostent_addr;
+			_hostent_addr = *(uint32_t*)(d);
+			return &_hostent;
+		}
+		d += dlen;
+	}
+
+_nope:
+	fprintf(stderr, "gethostbyname: no viable answer\n");
+	return NULL;
 }
 
 int getnameinfo(const struct sockaddr *addr, socklen_t addrlen,

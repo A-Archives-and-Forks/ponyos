@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/signal_defs.h>
+#include <sys/signal.h>
 
 #ifdef __x86_64__
 #include <kernel/arch/x86_64/pml.h>
@@ -73,6 +74,12 @@ typedef struct file_descriptors {
 	spin_lock_t lock;
 } fd_table_t;
 
+struct signal_config {
+	uintptr_t handler;
+	sigset_t  mask;
+	int flags;
+};
+
 #define PROC_FLAG_IS_TASKLET 0x01
 #define PROC_FLAG_FINISHED   0x02
 #define PROC_FLAG_STARTED    0x04
@@ -82,6 +89,8 @@ typedef struct file_descriptors {
 
 #define PROC_FLAG_TRACE_SYSCALLS     0x40
 #define PROC_FLAG_TRACE_SIGNALS      0x80
+
+#define PROC_FLAG_RESTORE_SIGMASK    0x100
 
 typedef struct process {
 	pid_t id;    /* PID */
@@ -110,11 +119,9 @@ typedef struct process {
 
 	tree_node_t * tree_entry;
 	struct regs * syscall_registers;
-	struct regs * interrupt_registers;
 	list_t * wait_queue;
 	list_t * shm_mappings;
 	list_t * node_waits;
-	list_t * signal_queue;
 
 	node_t sched_node;
 	node_t sleep_node;
@@ -125,12 +132,14 @@ typedef struct process {
 	int awoken_index;
 
 	thread_t thread;
-	thread_t signal_state;
 	image_t image;
 
 	spin_lock_t sched_lock;
 
-	uintptr_t signals[NUMSIGNALS+1];
+	struct signal_config signals[NUMSIGNALS+1];
+	sigset_t blocked_signals;
+	sigset_t pending_signals;
+	sigset_t awaited_signals;
 
 	int supplementary_group_count;
 	gid_t * supplementary_group_list;
@@ -152,6 +161,7 @@ typedef struct process {
 
 	/* Syscall restarting */
 	long interrupted_system_call;
+	sigset_t restored_signals;
 } process_t;
 
 typedef struct {
@@ -194,15 +204,15 @@ struct ProcessorLocal {
 	int cpu_id;
 	union PML * current_pml;
 
-	struct regs * interrupt_registers;
-
 #ifdef __x86_64__
 	int lapic_id;
 	/* Processor information loaded at startup. */
 	int  cpu_model;
 	int  cpu_family;
 	char cpu_model_name[48];
-	const char * cpu_manufacturer;
+	const char * cpu_manufacturer; /* 0x68 */
+	uintptr_t syscall_stack;       /* 0x70: Should match TSS.RSP[0] */
+	uintptr_t user_sysret_stack;   /* 0x78: Used only at start of SYSCALL entry to store user RSP before pushing it */
 #endif
 
 #ifdef __aarch64__
@@ -256,6 +266,7 @@ extern pid_t clone(uintptr_t new_stack, uintptr_t thread_func, uintptr_t arg);
 extern int waitpid(int pid, int * status, int options);
 extern int exec(const char * path, int argc, char *const argv[], char *const env[], int interp_depth);
 extern void update_process_usage(uint64_t clock_ticks, uint64_t perf_scale);
+extern void update_process_times_on_exit(void);
 
 extern tree_t * process_tree;  /* Parent->Children tree */
 extern list_t * process_list;  /* Flat storage */
@@ -273,5 +284,5 @@ extern void arch_enter_user(uintptr_t entrypoint, int argc, char * argv[], char 
 __attribute__((noreturn))
 extern void arch_enter_signal_handler(uintptr_t,int,struct regs*);
 extern void arch_wakeup_others(void);
-extern void arch_return_from_signal_handler(struct regs *r);
+extern int arch_return_from_signal_handler(struct regs *r);
 

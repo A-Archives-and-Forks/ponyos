@@ -357,13 +357,15 @@ void arch_dump_traceback(void) {
  *
  * @param fromAddr The low address to map, should be page aligned.
  */
-static void map_more_stack(uintptr_t fromAddr) {
+static int map_more_stack(uintptr_t fromAddr) {
 	volatile process_t * volatile proc = this_core->current_process;
 
 	/* Is this thread the process leader? */
 	if (proc->group != 0) {
 		proc = process_from_pid(proc->group);
 	}
+
+	if (!proc) return 0;
 
 	/* Make sure nothing else is going to mess with this process's page tables */
 	spin_lock(proc->image.lock);
@@ -378,6 +380,7 @@ static void map_more_stack(uintptr_t fromAddr) {
 	proc->image.userstack = fromAddr;
 
 	spin_unlock(proc->image.lock);
+	return 1;
 }
 
 /**
@@ -446,7 +449,7 @@ static void panic(const char * desc, struct regs * r, uintptr_t faulting_address
  * @param r Interrupt register context
  * @return Register context, which should be unmodified.
  */
-static struct regs * _debug_int(struct regs * r) {
+static void _debug_int(struct regs * r) {
 	/* Unset the debug flag */
 	r->rflags &= ~(1 << 8);
 
@@ -454,9 +457,6 @@ static struct regs * _debug_int(struct regs * r) {
 	if (this_core->current_process->flags & PROC_FLAG_TRACE_SIGNALS) {
 		ptrace_signal(SIGTRAP, PTRACE_EVENT_SINGLESTEP);
 	}
-
-	/* Return from interrupt */
-	return r;
 }
 
 /**
@@ -499,8 +499,8 @@ static void _page_fault(struct regs * r) {
 	uintptr_t faulting_address;
 	asm volatile("mov %%cr2, %0" : "=r"(faulting_address));
 
-	/* 8DEADBEEFh is the magic ret-from-sig address. */
-	if (faulting_address == 0x8DEADBEEF) {
+	/* magic ret-from-sig address */
+	if (faulting_address == 0x516) {
 		return_from_signal_handler(r);
 		return;
 	}
@@ -520,36 +520,11 @@ static void _page_fault(struct regs * r) {
 
 	/* Quietly map more stack if it was a viable stack address. */
 	if (faulting_address < 0x800000000000 && faulting_address > 0x700000000000) {
-		map_more_stack(faulting_address & 0xFFFFffffFFFFf000);
-		return;
+		if (map_more_stack(faulting_address & 0xFFFFffffFFFFf000)) return;
 	}
 
 	/* Otherwise, segfault the current process. */
 	send_signal(this_core->current_process->id, SIGSEGV, 1);
-}
-
-/**
- * @brief Legacy system call entrypoint.
- *
- * We don't have a non-legacy entrypoint, but this use of
- * an interrupt to make syscalls is considered "legacy"
- * by the existence of its replacement (SYSCALL/SYSRET).
- *
- * @param r Interrupt register context, which contains syscall arguments.
- * @return Register state after system call, which contains return value.
- */
-static struct regs * _syscall_entrypoint(struct regs * r) {
-	/* syscall_handler will modify r to set return value. */
-	syscall_handler(r);
-
-	/*
-	 * I'm not actually sure if we're still cli'ing in any of the
-	 * syscall handlers, but definitely make sure we're not allowing
-	 * interrupts to remain disabled upon return from a system call.
-	 */
-	asm volatile("sti");
-
-	return r;
 }
 
 /**
@@ -560,11 +535,10 @@ static struct regs * _syscall_entrypoint(struct regs * r) {
  * @param r Interrupt register context
  * @return Register state after resume from task task switch.
  */
-static struct regs * _local_timer(struct regs * r) {
+static void _local_timer(struct regs * r) {
 	extern void arch_update_clock(void);
 	arch_update_clock();
-	switch_task(1);
-	return r;
+	if (r->cs != 0x08) switch_task(1);
 }
 
 /**
@@ -573,13 +547,13 @@ static struct regs * _local_timer(struct regs * r) {
  * @param r           Interrupt register context
  * @param description Textual description of the exception, for panic messages.
  */
-static void _exception(struct regs * r, const char * description) {
+static void _exception(struct regs * r, const char * description, int signum) {
 	/* If we were in kernel space, this is a panic */
 	if (!this_core->current_process || r->cs == 0x08) {
 		panic(description, r, r->int_no);
 	}
-	/* Otherwise, these interrupts should trigger SIGILL */
-	send_signal(this_core->current_process->id, SIGILL, 1);
+	/* Otherwise, these interrupts should trigger a signal */
+	send_signal(this_core->current_process->id, signum, 1);
 }
 
 /**
@@ -600,37 +574,37 @@ static void _handle_irq(struct regs * r, int irq) {
 	irq_ack(irq);
 }
 
-#define EXC(i,n) case i: _exception(r, n); break;
+#define EXC(i,n,s) case i: _exception(r, n, s); break;
 #define IRQ(i) case i: _handle_irq(r,i-32); break;
 
-struct regs * isr_handler_inner(struct regs * r) {
+void isr_handler_inner(struct regs * r) {
 	switch (r->int_no) {
-		EXC(0,"divide-by-zero");
-		case 1: return _debug_int(r);
+		EXC(0,"divide-by-zero",SIGFPE);
+		case 1: _debug_int(r); return;
 		/* NMI doesn't reach here, we use it as a panic signal. */
-		EXC(3,"breakpoint"); /* TODO: This should map to a ptrace event */
-		EXC(4,"overflow");
-		EXC(5,"bound range exceeded");
-		EXC(6,"invalid opcode");
-		EXC(7,"device not available");
+		EXC(3,"breakpoint",SIGTRAP); /* TODO: This should map to a ptrace event */
+		EXC(4,"overflow",SIGFPE);
+		EXC(5,"bound range exceeded",SIGBUS);
+		EXC(6,"invalid opcode",SIGILL);
+		EXC(7,"device not available",SIGBUS);
 		case 8: _double_fault(r); break;
 		/* 9 is a legacy exception that shouldn't happen */
-		EXC(10,"invalid TSS");
-		EXC(11,"segment not present");
-		EXC(12,"stack-segment fault");
+		EXC(10,"invalid TSS",SIGBUS);
+		EXC(11,"segment not present",SIGBUS);
+		EXC(12,"stack-segment fault",SIGBUS);
 		case 13: _general_protection_fault(r); break;
 		case 14: _page_fault(r); break;
 		/* 15 is reserved */
-		EXC(16,"floating point exception");
-		EXC(17,"alignment check");
-		EXC(18,"machine check");
-		EXC(19,"SIMD floating-point exception");
-		EXC(20,"virtualization exception");
-		EXC(21,"control protection exception");
+		EXC(16,"floating point exception",SIGFPE);
+		EXC(17,"alignment check",SIGBUS);
+		EXC(18,"machine check",SIGBUS);
+		EXC(19,"SIMD floating-point exception",SIGFPE);
+		EXC(20,"virtualization exception",SIGBUS);
+		EXC(21,"control protection exception",SIGBUS);
 		/* 22 through 27 are reserved */
-		EXC(28,"hypervisor injection exception");
-		EXC(29,"VMM communication exception");
-		EXC(30,"security exception");
+		EXC(28,"hypervisor injection exception",SIGBUS);
+		EXC(29,"VMM communication exception",SIGBUS);
+		EXC(30,"security exception",SIGBUS);
 		/* 31 is reserved */
 
 		/* 16 IRQs that go to the general IRQ chain */
@@ -652,8 +626,8 @@ struct regs * isr_handler_inner(struct regs * r) {
 		IRQ(47);
 
 		/* Local interrupts that make it here. */
-		case 123: return _local_timer(r);
-		case 127: return _syscall_entrypoint(r);
+		case 123: _local_timer(r); return;
+		case 127: syscall_handler(r); return;
 
 		/* Other interrupts that don't make it here:
 		 *   124: TLB shootdown, we just reload CR3 in the handler.
@@ -670,24 +644,28 @@ struct regs * isr_handler_inner(struct regs * r) {
 		 * to run that was awoken by the interrupt. */
 		switch_next();
 	}
-
-	return r;
 }
 
-struct regs * isr_handler(struct regs * r) {
+void isr_handler(struct regs * r) {
 	int from_userspace = r->cs != 0x08;
-	this_core->interrupt_registers = r;
 
 	if (from_userspace && this_core->current_process) {
 		this_core->current_process->time_switch = arch_perf_timer();
 	}
 
-	struct regs * out = isr_handler_inner(r);
+	isr_handler_inner(r);
 
 	if (from_userspace && this_core->current_process) {
-		process_check_signals(out);
+		process_check_signals(r);
+		update_process_times_on_exit();
 	}
+}
 
-	return out;
+void syscall_centry(struct regs * r) {
+	this_core->current_process->time_switch = arch_perf_timer();
 
+	syscall_handler(r);
+
+	process_check_signals(r);
+	update_process_times_on_exit();
 }

@@ -31,14 +31,12 @@ static int port_fd = -1;
 
 /* outw / inb helper functions */
 static void outports(unsigned short _port, unsigned short _data) {
-	lseek(port_fd, _port, SEEK_SET);
-	write(port_fd, &_data, 2);
+	pwrite(port_fd, &_data, 2, _port);
 }
 
 static unsigned char inportb(unsigned short _port) {
 	unsigned char out;
-	lseek(port_fd, _port, SEEK_SET);
-	read(port_fd, &out, 1);
+	pread(port_fd, &out, 1, _port);
 	return out;
 }
 
@@ -113,6 +111,11 @@ int main(int argc, char * argv[]) {
 	}
 
 	port_fd = open("/dev/port", O_RDWR);
+
+	if (port_fd < 0) {
+		/* Try the special aarch64 interface. */
+		port_fd = open("/dev/fwcfg", O_RDWR);
+	}
 
 	if (port_fd < 0) {
 		fprintf(stderr, "%s: could not open port IO device\n", argv[0]);

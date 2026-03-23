@@ -795,9 +795,23 @@ void * mmu_map_mmio_region(uintptr_t physical_address, size_t size) {
 	return out;
 }
 
+static uintptr_t module_base_address = MODULE_BASE_START;
+
 void * mmu_map_module(size_t size) {
-	printf("attempt to map module\n");
-	return NULL;
+	if (size & PAGE_LOW_MASK) {
+		size += (PAGE_LOW_MASK + 1) - (size & PAGE_LOW_MASK);
+	}
+
+	spin_lock(module_space_lock);
+	void * out = (void*)module_base_address;
+	for (size_t i = 0; i < size; i += PAGE_SIZE) {
+		union PML * p = mmu_get_page(module_base_address + i, MMU_GET_MAKE);
+		mmu_frame_allocate(p, MMU_FLAG_KERNEL | MMU_FLAG_WRITABLE);
+	}
+	module_base_address += size;
+	spin_unlock(module_space_lock);
+
+	return out;
 }
 
 void mmu_unmap_module(uintptr_t start_address, size_t size) {
@@ -808,7 +822,7 @@ int mmu_copy_on_write(uintptr_t address) {
 	return 1;
 }
 
-int mmu_validate_user_pointer(void * addr, size_t size, int flags) {
+int mmu_validate_user_pointer(const void * addr, size_t size, int flags) {
 	//printf("mmu_validate_user_pointer(%#zx, %lu, %u);\n", (uintptr_t)addr, size, flags);
 	if (addr == NULL && !(flags & MMU_PTR_NULL)) return 0;
 	if (size >     0x800000000000) return 0;
@@ -867,7 +881,7 @@ void mmu_init(uintptr_t memaddr, size_t memsize, uintptr_t firstFreePage, uintpt
 	init_page_region[510].raw = k2p(&heap_base_pml) | PTE_VALID | PTE_TABLE | PTE_AF;
 
 	/* "Identity" map at -512GiB */
-	for (size_t i = 0; i < 64; ++i) {
+	for (size_t i = 0; i < 500; ++i) {
 		high_base_pml[i].raw = (i << 30) | PTE_VALID | PTE_AF | (1 << 2);
 	}
 
@@ -933,5 +947,8 @@ void mmu_init(uintptr_t memaddr, size_t memsize, uintptr_t firstFreePage, uintpt
 	heapStart = (char*)KERNEL_HEAP_START + bytesOfFrames;
 
 	lowest_available = (firstFreePage + bytesOfFrames) - memaddr;
-
+	module_base_address = endOfRamDisk + MODULE_BASE_START;
+	if (module_base_address & PAGE_LOW_MASK) {
+		module_base_address = (module_base_address & PAGE_SIZE_MASK) + PAGE_SIZE;
+	}
 }

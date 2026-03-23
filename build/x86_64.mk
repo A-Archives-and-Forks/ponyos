@@ -1,6 +1,6 @@
 ARCH=x86_64
 
-ARCH_KERNEL_CFLAGS  = -mno-red-zone -fno-omit-frame-pointer -mfsgsbase
+ARCH_KERNEL_CFLAGS  = -mno-red-zone -fno-omit-frame-pointer -mfsgsbase -fPIE
 ARCH_KERNEL_CFLAGS += -mgeneral-regs-only -z max-page-size=0x1000 -nostdlib
 ARCH_USER_CFLAGS += -z max-page-size=0x1000 --sysroot=base
 
@@ -25,7 +25,8 @@ EMU_ARGS += -smp $(SMP)
 EMU_ARGS += ${EMU_KVM}
 EMU_ARGS += -no-reboot
 EMU_ARGS += -serial mon:stdio
-EMU_ARGS += -soundhw pcspk,ac97
+EMU_ARGS += -device AC97
+EMU_ARGS += -name "ToaruOS ${ARCH}"
 
 # UTC is the default setting.
 #EMU_ARGS += -rtc base=utc
@@ -61,20 +62,19 @@ test: system
 shell: system
 	${EMU} -M ${EMU_MACH} -m $(RAM) -smp $(SMP) ${EMU_KVM} -cdrom image.iso \
 		-nographic -no-reboot -audiodev none,id=id -serial null -serial mon:stdio \
-		-fw_cfg name=opt/org.toaruos.gettyargs,string="-a local /dev/ttyS1" \
-		-fw_cfg name=opt/org.toaruos.bootmode,string=headless \
-		-fw_cfg name=opt/org.toaruos.term,string=${TERM}
+		-fw_cfg name=opt/org.toaruos.gettyargs,string="-a local /dev/ttyS1 115200 ${TERM}" \
+		-fw_cfg name=opt/org.toaruos.bootmode,string=headless
 
 misaka-kernel: ${KERNEL_ASMOBJS} ${KERNEL_OBJS} kernel/symbols.o
-	${CC} -g -T kernel/arch/${ARCH}/link.ld ${KERNEL_CFLAGS} -o $@.64 ${KERNEL_ASMOBJS} ${KERNEL_OBJS} kernel/symbols.o
-	${OC} --strip-debug -I elf64-x86-64 -O elf32-i386 $@.64 $@
+	${CC} -g -T kernel/arch/${ARCH}/link.ld ${KERNEL_CFLAGS} -Wl,-static,-pie,--no-dynamic-linker,-z,notext,-z,norelro -o $@.64 ${KERNEL_ASMOBJS} ${KERNEL_OBJS} kernel/symbols.o
+	cp $@.64 $@
+	${STRIP} $@
 
 # Loader stuff, legacy CDs
 fatbase/ramdisk.igz: ramdisk.igz
 	cp $< $@
 fatbase/kernel: misaka-kernel
 	cp $< $@
-	strip $@
 
 cdrom/fat.img: fatbase/ramdisk.igz fatbase/kernel fatbase/efi/boot/bootx64.efi util/mkdisk.sh | dirs
 	util/mkdisk.sh $@ fatbase
@@ -105,7 +105,7 @@ fatbase/efi/boot/bootx64.efi: boot/efi64.so
 BUILD_KRK=$(TOOLCHAIN)/local/bin/kuroko
 $(TOOLCHAIN)/local/bin/kuroko: kuroko/src/*.c
 	mkdir -p $(TOOLCHAIN)/local/bin
-	cc -Ikuroko/src -DNO_RLINE -DSTATIC_ONLY -DKRK_DISABLE_THREADS -o "${TOOLCHAIN}/local/bin/kuroko" kuroko/src/*.c
+	cc -Ikuroko/src -DKRK_BUNDLE_LIBS="BUNDLED(os);BUNDLED(fileio);" -DNO_RLINE -DKRK_STATIC_ONLY -DKRK_DISABLE_THREADS -o "${TOOLCHAIN}/local/bin/kuroko" kuroko/src/*.c kuroko/src/modules/module_os.c kuroko/src/modules/module_fileio.c
 
 image.iso: cdrom/fat.img cdrom/boot.sys boot/mbr.S util/update-extents.krk | $(BUILD_KRK)
 	xorriso -as mkisofs -R -J -c bootcat \

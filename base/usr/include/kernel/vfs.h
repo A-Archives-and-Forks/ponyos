@@ -20,6 +20,7 @@
 #define FS_PIPE        0x10
 #define FS_SYMLINK     0x20
 #define FS_MOUNTPOINT  0x40
+#define FS_SOCKET      0x80
 
 #define _IFMT       0170000 /* type of file */
 #define     _IFDIR  0040000 /* directory */
@@ -49,19 +50,24 @@ typedef ssize_t (*readlink_type_t) (struct fs_node *, char * buf, size_t size);
 typedef int (*selectcheck_type_t) (struct fs_node *);
 typedef int (*selectwait_type_t) (struct fs_node *, void * process);
 typedef int (*chown_type_t) (struct fs_node *, uid_t, gid_t);
-typedef int (*truncate_type_t) (struct fs_node *);
+typedef int (*truncate_type_t) (struct fs_node *, size_t size);
+typedef int (*rename_type_t) (struct fs_node *, struct fs_node *, const char *, struct fs_node *, const char *);
 
 typedef struct fs_node {
+	struct fs_node * mount;      /* Root fs_node_t entry of mountpoint. */
 	char name[256];         /* The filename. */
 	void * device;          /* Device object (optional) */
-	mode_t mask;          /* The permissions mask. */
-	uid_t uid;           /* The owning user. */
-	uid_t gid;           /* The owning group. */
+	mode_t mask;            /* The permissions mask. */
+	uid_t uid;              /* The owning user. */
+	uid_t gid;              /* The owning group. */
 	uint64_t flags;         /* Flags (node type, etc). */
 	uint64_t inode;         /* Inode number. */
 	uint64_t length;        /* Size of the file, in byte. */
 	uint64_t impl;          /* Used to keep track which fs it belongs to. */
 	uint64_t open_flags;    /* Flags passed to open (read/write/append, etc.) */
+	struct fs_node *ptr;    /* Alias pointer, for symlinks. */
+	int64_t refcount;       /* Node reference count */
+	uint64_t nlink;         /* Number of links in underlying filesystem */
 
 	/* times */
 	time_t atime;         /* Accessed */
@@ -84,15 +90,10 @@ typedef struct fs_node {
 	symlink_type_t symlink;
 	readlink_type_t readlink;
 	truncate_type_t truncate;
-
-	struct fs_node *ptr;   /* Alias pointer, for symlinks. */
-	int64_t refcount;
-	uint64_t nlink;
-
 	selectcheck_type_t selectcheck;
 	selectwait_type_t selectwait;
-
 	chown_type_t chown;
+	rename_type_t rename;
 } fs_node_t;
 
 struct vfs_entry {
@@ -125,10 +126,10 @@ int symlink_fs(char * value, char * name);
 ssize_t readlink_fs(fs_node_t * node, char * buf, size_t size);
 int selectcheck_fs(fs_node_t * node);
 int selectwait_fs(fs_node_t * node, void * process);
-int truncate_fs(fs_node_t * node);
+int truncate_fs(fs_node_t * node, size_t size);
 
 void vfs_install(void);
-void * vfs_mount(const char * path, fs_node_t * local_root);
+void * vfs_mount(const char * path, fs_node_t * local_root, const char * type, const char * options);
 typedef fs_node_t * (*vfs_mount_callback)(const char * arg, const char * mount_point);
 int vfs_register(const char * name, vfs_mount_callback callback);
 int vfs_mount_type(const char * type, const char * arg, const char * mountpoint);

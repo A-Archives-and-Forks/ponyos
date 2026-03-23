@@ -8,7 +8,7 @@
 #include <toaru/panel.h>
 #include <toaru/icon_cache.h>
 
-#define GRADIENT_HEIGHT (PANEL_HEIGHT-2*Y_PAD)
+#define GRADIENT_HEIGHT 27
 #define GRADIENT_AT(y) premultiply(rgba(255,72,254,220-y*7))
 #define MAX_TEXT_WIDTH 180
 #define MIN_TEXT_WIDTH 50

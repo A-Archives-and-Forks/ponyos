@@ -111,10 +111,11 @@ static ssize_t readlink_tmpfs(fs_node_t * node, char * buf, size_t size) {
 }
 
 static struct tmpfs_dir * tmpfs_dir_new(char * name, struct tmpfs_dir * parent) {
-	struct tmpfs_dir * d = malloc(sizeof(struct tmpfs_dir));
+	struct tmpfs_dir * d = calloc(1, sizeof(struct tmpfs_dir));
 	spin_init(d->lock);
 	spin_init(d->nest_lock);
 	d->mount = parent ? parent->mount : NULL;
+	d->parent = parent;
 	d->name = strdup(name);
 	d->type = TMPFS_TYPE_DIR;
 	d->mask = 0;
@@ -640,6 +641,18 @@ static int rename_tmpfs(fs_node_t * mount_root, fs_node_t * src_dir, const char 
 		/* Destination ended with trailing slashes, but was not a directory. */
 		ret = -ENOTDIR;
 		goto _cleanup;
+	}
+
+	/* Check that src_file isn't a parent of dest_file */
+	if (src_file->type == TMPFS_TYPE_DIR) {
+		struct tmpfs_dir * pd = dd;
+		while (pd) {
+			if ((void*)pd == (void*)src_file) {
+				ret = -EINVAL;
+				goto _cleanup;
+			}
+			pd = pd->parent;
+		}
 	}
 
 	if (!dest_file) {

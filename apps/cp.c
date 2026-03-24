@@ -84,10 +84,7 @@ static int copy_file(char * source, char * dest, int mode,int uid, int gid) {
 	close(s_fd);
 	close(d_fd);
 
-	if (chown(dest, uid, gid) < 0) {
-		fprintf(stderr, APP_NAME ": %s: %s\n", dest, strerror(errno));
-		return 1;
-	}
+	chown(dest, uid, gid);
 	return 0;
 }
 
@@ -195,9 +192,8 @@ int main(int argc, char ** argv) {
 			case 'P':
 				symlinks = 0;
 				break;
-			default:
-				fprintf(stderr, "cp: unrecognized option '%c'\n", opt);
-				break;
+			case '?':
+				return 1;
 		}
 	}
 

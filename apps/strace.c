@@ -210,6 +210,76 @@ char syscall_mask[] = {
 	[SYS_GETPEERNAME]  = 1,
 };
 
+static const int syscall_set_net[] = {
+	SYS_SOCKET, SYS_SETSOCKOPT, SYS_BIND, SYS_ACCEPT, SYS_LISTEN,
+	SYS_CONNECT, SYS_GETSOCKOPT, SYS_RECV, SYS_SEND, SYS_SHUTDOWN,
+	SYS_GETPEERNAME, SYS_GETSOCKNAME, 0
+};
+
+static const int syscall_set_file[] = {
+	SYS_OPEN, SYS_STATF, SYS_LSTAT, SYS_ACCESS, SYS_EXECVE,
+	SYS_GETCWD, SYS_CHDIR, SYS_MKDIR, SYS_SYMLINK, SYS_UNLINK,
+	SYS_CHMOD, SYS_CHOWN, SYS_MOUNT, SYS_READLINK, SYS_RENAME,
+	SYS_TRUNCATE, 0
+};
+
+static const int syscall_set_desc[] = {
+	SYS_OPEN, SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_STAT, SYS_FSWAIT,
+	SYS_FSWAIT2, SYS_FSWAIT3, SYS_SEEK, SYS_IOCTL, SYS_PIPE,
+	SYS_DUP2, SYS_READDIR, SYS_OPENPTY, SYS_PREAD, SYS_PWRITE, SYS_FCNTL,
+	SYS_FCHMOD, SYS_FCHOWN, SYS_FTRUNCATE, 0
+};
+
+static const int syscall_set_memory[] = {
+	SYS_SBRK, SYS_SHM_OBTAIN, SYS_SHM_RELEASE, 0
+};
+
+static const int syscall_set_ipc[] = {
+	SYS_SHM_OBTAIN, SYS_SHM_RELEASE, 0
+};
+
+static const int syscall_set_signal[] = {
+	SYS_SIGNAL, SYS_KILL, SYS_SIGACTION, SYS_SIGPENDING, SYS_SIGPROCMASK,
+	SYS_SIGSUSPEND, SYS_SIGWAIT, 0
+};
+
+static const int syscall_set_process[] = {
+	SYS_EXT, SYS_EXECVE, SYS_FORK, SYS_CLONE, SYS_WAITPID, SYS_KILL, 0
+};
+
+static const int syscall_set_creds[] = {
+	SYS_GETUID, SYS_GETGID, SYS_GETGROUPS, SYS_GETEGID, SYS_GETEUID,
+	SYS_SETUID, SYS_SETGID, SYS_SETGROUPS, 0
+};
+
+static const int syscall_set_stat[] = {
+	SYS_STAT, SYS_STATF, SYS_LSTAT, 0
+};
+
+static const int syscall_set_clock[] = {
+	SYS_GETTIMEOFDAY, SYS_SETTIMEOFDAY, 0
+};
+
+struct SyscallSet {
+	const char * name;
+	const int * syscalls;
+};
+
+static const struct SyscallSet syscall_sets[] = {
+	{"net",     syscall_set_net},
+	{"network", syscall_set_net}, /* Alias */
+	{"file",    syscall_set_file},
+	{"desc",    syscall_set_desc},
+	{"memory",  syscall_set_memory},
+	{"ipc",     syscall_set_ipc},
+	{"signal",  syscall_set_signal},
+	{"process", syscall_set_process},
+	{"creds",   syscall_set_creds},
+	{"stat",    syscall_set_stat},
+	{"clock",   syscall_set_clock},
+	{NULL, NULL}
+};
+
 #define M(e) [e] = #e
 const char * errno_names[] = {
 	M(EPERM),
@@ -704,14 +774,7 @@ static void signal_arg(int signum) {
 	}
 }
 
-static void sigset_ptr_arg(pid_t pid, uintptr_t ptr) {
-	if (!ptr) {
-		fprintf(logfile, "NULL");
-		return;
-	}
-
-	uint64_t sigset = data_read_ptr(pid, ptr);
-
+static void sigset_arg(uint64_t sigset) {
 	/* handle special cases */
 	if (sigset == 0xFFFFffffFFFFffff) {
 		fprintf(logfile, "sigfillset()");
@@ -736,6 +799,51 @@ static void sigset_ptr_arg(pid_t pid, uintptr_t ptr) {
 		}
 	}
 	fprintf(logfile, "}");
+}
+
+static void sigset_ptr_arg(pid_t pid, uintptr_t ptr) {
+	if (!ptr) {
+		fprintf(logfile, "NULL");
+		return;
+	}
+
+	uint64_t sigset = data_read_ptr(pid, ptr);
+
+	sigset_arg(sigset);
+}
+
+static void sigaction_ptr_arg(pid_t pid, uintptr_t ptr) {
+	if (!ptr) {
+		fprintf(logfile, "NULL");
+		return;
+	}
+
+	struct sigaction sa = {0};
+	data_read_bytes(pid, ptr, (char*)&sa, sizeof(struct sigaction));
+
+	fprintf(logfile, "{sa_flags=");
+
+	int flags = sa.sa_flags;
+	if (!flags) fprintf(logfile,"0");
+	else {
+		H(SA_NOCLDSTOP);
+		H(SA_SIGINFO);
+		H(SA_NODEFER);
+		H(SA_RESETHAND);
+		H(SA_RESTART);
+		if (flags) fprintf(logfile,"%#x",flags);
+	}
+
+	fprintf(logfile,",sa_mask=");
+	sigset_arg(sa.sa_mask);
+	fprintf(logfile,",sa_handler=");
+
+	if (sa.sa_handler == SIG_DFL) fprintf(logfile,"SIG_DFL");
+	else if (sa.sa_handler == SIG_IGN) fprintf(logfile,"SIG_IGN");
+	else if (sa.sa_handler == SIG_ERR) fprintf(logfile,"SIG_ERR");
+	else pointer_arg((uintptr_t)sa.sa_handler);
+
+	fprintf(logfile,"}");
 }
 
 static void signal_ptr_arg(pid_t pid, uintptr_t ptr) {
@@ -984,8 +1092,8 @@ static void handle_syscall(pid_t pid, struct URegs * r) {
 			break;
 		case SYS_SIGACTION:
 			signal_arg(uregs_syscall_arg1(r)); COMMA;
-			pointer_arg(uregs_syscall_arg2(r)); COMMA;
-			pointer_arg(uregs_syscall_arg3(r)); /* sigaction output */
+			sigaction_ptr_arg(pid, uregs_syscall_arg2(r)); COMMA;
+			/* one output arg */
 			break;
 		case SYS_SIGPENDING:
 			/* output only */
@@ -1124,6 +1232,11 @@ static void finish_syscall(pid_t pid, int syscall, struct URegs * r) {
 		case SYS_GETSOCKNAME:
 		case SYS_GETPEERNAME:
 			sockaddrp_arg(pid, uregs_syscall_arg2(r), uregs_syscall_arg3(r)); /* Consumes both */
+			maybe_errno(r);
+			break;
+		case SYS_SIGACTION:
+			sigaction_ptr_arg(pid, uregs_syscall_arg3(r));
+			maybe_errno(r);
 			break;
 		/* Most things return -errno, or positive valid result */
 		default:
@@ -1138,9 +1251,17 @@ static int usage(char * argv[]) {
 	fprintf(stderr, "usage: %s [-o logfile] [-e trace=...] [-p PID] [command...]\n"
 			"  -o logfile   " T_I "Write tracing output to a file." T_O "\n"
 			"  -h           " T_I "Show this help text." T_O "\n"
-			"  -e trace=... " T_I "Set tracing options." T_O "\n"
-			"  -p PID       " T_I "Trace an existing process." T_O "\n",
+			"  -e trace=... " T_I "Trace the specified syscalls, or groups of syscalls:" T_O "\n"
+			"               ",
 			argv[0]);
+
+	for (const struct SyscallSet * set = syscall_sets; set->name; set++) {
+		fprintf(stderr, "%s%%%s", (set != syscall_sets) ? ", " : "", set->name);
+	}
+
+	fprintf(stderr,
+			"\n"
+			"  -p PID       " T_I "Trace an existing process." T_O "\n");
 	return 1;
 }
 
@@ -1174,78 +1295,17 @@ int main(int argc, char * argv[]) {
 
 						if (*option == '%') {
 							/* Check for special options */
-							if (!strcmp(option+1,"net") || !strcmp(option+1,"network")) {
-								int syscalls[] = {
-									SYS_SOCKET, SYS_SETSOCKOPT, SYS_BIND, SYS_ACCEPT, SYS_LISTEN,
-									SYS_CONNECT, SYS_GETSOCKOPT, SYS_RECV, SYS_SEND, SYS_SHUTDOWN,
-									SYS_GETPEERNAME, SYS_GETSOCKNAME,
-									0
-								};
-								for (int *i = syscalls; *i; i++) {
-									syscall_mask[*i] = 1;
+							const int *syscalls = NULL;
+
+							for (const struct SyscallSet * set = syscall_sets; set->name; set++) {
+								if (!strcmp(set->name, option+1)) {
+									syscalls = set->syscalls;
+									break;
 								}
-							} else if (!strcmp(option+1,"file")) {
-								int syscalls[] = {
-									SYS_OPEN, SYS_STATF, SYS_LSTAT, SYS_ACCESS, SYS_EXECVE,
-									SYS_GETCWD, SYS_CHDIR, SYS_MKDIR, SYS_SYMLINK, SYS_UNLINK,
-									SYS_CHMOD, SYS_CHOWN, SYS_MOUNT, SYS_READLINK, SYS_RENAME,
-									SYS_TRUNCATE,
-									0
-								};
-								for (int *i = syscalls; *i; i++) {
-									syscall_mask[*i] = 1;
-								}
-							} else if (!strcmp(option+1,"desc")) {
-								int syscalls[] = {
-									SYS_OPEN, SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_STAT, SYS_FSWAIT,
-									SYS_FSWAIT2, SYS_FSWAIT3, SYS_SEEK, SYS_IOCTL, SYS_PIPE,
-									SYS_DUP2, SYS_READDIR, SYS_OPENPTY, SYS_PREAD, SYS_PWRITE, SYS_FCNTL,
-									SYS_FCHMOD, SYS_FCHOWN, SYS_FTRUNCATE,
-									0
-								};
-								for (int *i = syscalls; *i; i++) {
-									syscall_mask[*i] = 1;
-								}
-							} else if (!strcmp(option+1,"memory")) {
-								int syscalls[] = {
-									SYS_SBRK, SYS_SHM_OBTAIN, SYS_SHM_RELEASE,
-									0
-								};
-								for (int *i = syscalls; *i; i++) {
-									syscall_mask[*i] = 1;
-								}
-							} else if (!strcmp(option+1,"ipc")) {
-								int syscalls[] = {
-									SYS_SHM_OBTAIN, SYS_SHM_RELEASE,
-									0
-								};
-								for (int *i = syscalls; *i; i++) {
-									syscall_mask[*i] = 1;
-								}
-							} else if (!strcmp(option+1,"signal")) {
-								int syscalls[] = {
-									SYS_SIGNAL, SYS_KILL, SYS_SIGACTION, SYS_SIGPENDING, SYS_SIGPROCMASK,
-									SYS_SIGSUSPEND, SYS_SIGWAIT,
-									0
-								};
-								for (int *i = syscalls; *i; i++) {
-									syscall_mask[*i] = 1;
-								}
-							} else if (!strcmp(option+1,"process")) {
-								int syscalls[] = {
-									SYS_EXT, SYS_EXECVE, SYS_FORK, SYS_CLONE, SYS_WAITPID, SYS_KILL,
-									0
-								};
-								for (int *i = syscalls; *i; i++) {
-									syscall_mask[*i] = 1;
-								}
-							} else if (!strcmp(option+1,"creds")) {
-								int syscalls[] = {
-									SYS_GETUID, SYS_GETGID, SYS_GETGROUPS, SYS_GETEGID, SYS_GETEUID,
-									SYS_SETUID, SYS_SETGID, SYS_SETGROUPS,
-									0
-								};
-								for (int *i = syscalls; *i; i++) {
+							}
+
+							if (syscalls) {
+								for (const int *i = syscalls; *i; i++) {
 									syscall_mask[*i] = 1;
 								}
 							} else {

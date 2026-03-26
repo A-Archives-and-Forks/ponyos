@@ -8,6 +8,7 @@ export-cmd NO_EQUESTRIA kcmdline -g no-equestria
 # We haven't actually hit a login yet, so make sure these are set here...
 export USER=root
 export HOME=/home/root
+export PATH=/usr/bin:/bin
 
 export-cmd TZ_OFFSET find-timezone
 export-cmd GETTY_ARGS qemu-fwcfg opt/org.toaruos.gettyargs

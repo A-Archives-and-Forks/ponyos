@@ -41,7 +41,7 @@ enum header_columns {
 	COLUMN_S
 };
 
-#define T_T "\033[94m"
+#define T_T "\033[95m"
 #define T_G "\033[92m"
 #define T_C "\033[0;1m"
 #define T_B "\033[1m"
@@ -49,7 +49,7 @@ enum header_columns {
 #define T_K "\033[K"
 #define T_S "\033[97m"
 #define T_R "\033[30m"
-#define T_H "\033[44;30m"
+#define T_H "\033[45;30m"
 #define T_CR "\033[H"
 #define T_FC "\033[0;9%dm"
 #define T_BR "\033[90m"

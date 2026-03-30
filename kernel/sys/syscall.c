@@ -529,10 +529,12 @@ long sys_mkdir(char * path, uint64_t mode) {
 long sys_access(const char * file, long flags) {
 	PTR_VALIDATE(file);
 	if (!file) return -EFAULT;
+	if (flags < 0 || flags > 7) return -EINVAL;
 	fs_node_t * node = kopen((char *)file, 0);
 	if (!node) return -ENOENT;
+	int ret = flags ? (!has_permission(node, flags) ? -EACCES : 0) : 0;
 	close_fs(node);
-	return 0;
+	return ret;
 }
 
 long sys_chmod(char * file, long mode) {
@@ -885,12 +887,11 @@ long sys_chdir(char * newdir) {
 }
 
 long sys_getcwd(char * buf, size_t size) {
-	if (buf) {
-		PTR_VALIDATE(buf);
-		size_t len = strlen(this_core->current_process->wd_name) + 1;
-		return (long)memcpy(buf, this_core->current_process->wd_name, size < len ? size : len);
-	}
-	return 0;
+	PTRCHECK(buf,size,MMU_PTR_NULL|MMU_PTR_WRITE);
+	size_t len = strlen(this_core->current_process->wd_name) + 1;
+	if (size < len) return -ERANGE;
+	memcpy(buf, this_core->current_process->wd_name, len);
+	return len;
 }
 
 long sys_dup2(int old, int new) {
@@ -1061,17 +1062,13 @@ long sys_yield(void) {
 long sys_sleepabs(unsigned long seconds, unsigned long subseconds) {
 	/* Mark us as asleep until <some time period> */
 	sleep_until((process_t *)this_core->current_process, seconds, subseconds);
-
-	/* Switch without adding us to the queue */
-	//printf("process %p (pid=%d) entering sleep until %ld.%06ld\n", current_process, current_process->id, seconds, subseconds);
 	switch_task(0);
 
 	unsigned long timer_ticks = 0, timer_subticks = 0;
 	relative_time(0,0,&timer_ticks,&timer_subticks);
-	//printf("process %p (pid=%d) resumed from sleep at %ld.%06ld\n", current_process, current_process->id, timer_ticks, timer_subticks);
 
 	if (seconds > timer_ticks || (seconds == timer_ticks && subseconds >= timer_subticks)) {
-		return 1;
+		return seconds - timer_ticks;
 	} else {
 		return 0;
 	}
@@ -1300,7 +1297,8 @@ long sys_kill(pid_t process, int signal) {
 	}
 }
 
-long sys_reboot(void) {
+long sys_reboot(int unused) {
+	(void)unused;
 	if (this_core->current_process->user != USER_ROOT_UID) {
 		return -EPERM;
 	}

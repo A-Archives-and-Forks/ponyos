@@ -10,6 +10,7 @@ log-out,exit,Log Out
 :accessories
 exec calculator,calculator,Calculator
 exec file-browser,folder,File Browser
+exec netsurf,netsurf,Netsurf
 exec terminal,utilities-terminal,Terminal
 :demos
 &decorated,folder,Decorated
